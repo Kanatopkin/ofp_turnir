@@ -3,13 +3,15 @@ import shutil
 import subprocess
 import tempfile
 import urllib.request
+from collections import deque
 import cv2
 import mediapipe as mp
 import numpy as np
 
+# Используем более точную модель FULL вместо LITE для стабильности на темной одежде и улице
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
-    "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
 )
 
 
@@ -48,8 +50,8 @@ POSE_CONNECTIONS = [
 
 
 def ensure_model_path():
-    """Скачивает официальную модель MediaPipe Pose Landmarker при первом запуске."""
-    model_path = os.path.join(tempfile.gettempdir(), "pose_landmarker_lite.task")
+    """Скачивает модель MediaPipe Pose Landmarker Full при первом запуске."""
+    model_path = os.path.join(tempfile.gettempdir(), "pose_landmarker_full.task")
     if not os.path.exists(model_path):
         urllib.request.urlretrieve(MODEL_URL, model_path)
     return model_path
@@ -82,25 +84,22 @@ def draw_skeleton(frame, landmarks, chin_pt=None):
         )
 
 
-def draw_hud(frame, valid_reps, total_attempts, state, hang_sec, elbow_deg, knee_deg, bar_y, chin_y, active_errors):
+def draw_hud(frame, valid_reps, total_attempts, state, hang_sec, elbow_deg, knee_deg, bar_y, chin_above_now, active_errors):
     """Отрисовывает линию перекладины сверху и панель телеметрии (HUD) в левом нижнем углу."""
     h, w, _ = frame.shape
 
-    # Линия перекладины (зеленая, когда подбородок взял высоту, иначе желтая)
     if bar_y is not None:
         bar_px = int(bar_y * h)
-        chin_above = (chin_y is not None) and (chin_y <= bar_y + 0.025)
-        bar_color = (0, 255, 0) if chin_above else (0, 215, 255)
+        bar_color = (0, 255, 0) if chin_above_now else (0, 215, 255)
         cv2.line(frame, (0, bar_px), (w, bar_px), bar_color, 3)
         label_y = bar_px + 22 if bar_px < 35 else bar_px - 8
         cv2.putText(
             frame,
-            f"BAR LINE (Y={bar_y:.2f}) {'[CHIN ABOVE]' if chin_above else ''}",
+            f"BAR LINE (Y={bar_y:.2f}) {'[CHIN ABOVE]' if chin_above_now else ''}",
             (15, label_y),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2
         )
 
-    # Полупрозрачная плашка телеметрии в ЛЕВОМ НИЖНЕМ углу, чтобы не закрывать турник и руки
     overlay = frame.copy()
     box_w = min(w - 20, 430)
     box_h = 130
@@ -217,14 +216,14 @@ def convert_to_web_mp4(raw_video_path):
 def analyze_video_pose(
     video_path,
     manual_bar_y=None,
-    elbow_ext_angle=162.0,
-    min_hang_sec=0.85,
+    elbow_ext_angle=160.0,
+    min_hang_sec=0.80,
     generate_tracked_video=True,
     progress_callback=None
 ):
     """
-    Покадровый анализ видео на основе MediaPipe PoseLandmarker и конечного автомата (State Machine)
-    с защитой от перспективных искажений ракурса камеры и фильтрацией спрыгивания.
+    Покадровый анализ видео со сглаживанием координат и строгим контролем верхней точки
+    (подбородок выше грифа + острый угол в локтях + подъем плеч к перекладине).
     """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -252,14 +251,22 @@ def analyze_video_pose(
     last_hang_duration = 0.0
 
     bar_y_samples = []
+    shoulder_w_samples = []
     bar_y = manual_bar_y
+    base_shoulder_w = 0.12
+
+    # Буферы медианного сглаживания (по 3 кадрам) для защиты от одиночных выбросов нейросети
+    chin_buf = deque(maxlen=3)
+    elbow_buf = deque(maxlen=3)
+    knee_buf = deque(maxlen=3)
+    shoulder_y_buf = deque(maxlen=3)
 
     rep_start_time = 0.0
-    min_chin_y = 1.0
     min_elbow_in_rep = 180.0
+    min_shoulder_y_in_rep = 1.0
+    chin_above_frames = 0
     rep_errors = set()
 
-    # Счетчики кадров внутри одного повторения (чтобы единичный шум кадра не браковал попытку)
     rep_frames = 0
     asym_frames = 0
     knee_bent_frames = 0
@@ -279,9 +286,9 @@ def analyze_video_pose(
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=VisionRunningMode.VIDEO,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5
+        min_pose_detection_confidence=0.55,
+        min_pose_presence_confidence=0.55,
+        min_tracking_confidence=0.55
     )
 
     with PoseLandmarker.create_from_options(options) as landmarker:
@@ -306,8 +313,8 @@ def analyze_video_pose(
             results = landmarker.detect_for_video(mp_image, ts_ms)
 
             mean_elbow_angle = 0.0
-            mean_knee_angle = 0.0
-            chin_y = None
+            mean_knee_angle = 180.0
+            chin_above_now = False
 
             if results.pose_landmarks:
                 lm = results.pose_landmarks[0]
@@ -328,7 +335,8 @@ def analyze_video_pose(
                 m_r = pt(LM.MOUTH_RIGHT)
                 mouth_x = (m_l[0] + m_r[0]) / 2.0
                 mouth_y = (m_l[1] + m_r[1]) / 2.0
-                chin_y = mouth_y + 0.22 * abs(mouth_y - nose[1])
+                raw_chin_y = mouth_y + 0.22 * abs(mouth_y - nose[1])
+                raw_shoulder_y = (l_sh[1] + r_sh[1]) / 2.0
 
                 wrist_y = (l_wr[1] + r_wr[1]) / 2.0
                 wrist_x = (l_wr[0] + r_wr[0]) / 2.0
@@ -338,77 +346,110 @@ def analyze_video_pose(
 
                 angle_el_l = calculate_angle(l_sh, l_el, l_wr)
                 angle_el_r = calculate_angle(r_sh, r_el, r_wr)
-                mean_elbow_angle = (angle_el_l + angle_el_r) / 2.0
+                raw_elbow = (angle_el_l + angle_el_r) / 2.0
 
-                angle_kn_l = calculate_angle(l_hip, l_kn, l_an)
-                angle_kn_r = calculate_angle(r_hip, r_kn, r_an)
-                mean_knee_angle = (angle_kn_l + angle_kn_r) / 2.0
+                # Проверяем видимость коленей и лодыжек, чтобы избежать ложных 9 deg на темных штанах
+                kn_vis = min(lm[LM.LEFT_KNEE].visibility, lm[LM.RIGHT_KNEE].visibility)
+                if kn_vis > 0.45:
+                    angle_kn_l = calculate_angle(l_hip, l_kn, l_an)
+                    angle_kn_r = calculate_angle(r_hip, r_kn, r_an)
+                    raw_knee = (angle_kn_l + angle_kn_r) / 2.0
+                else:
+                    raw_knee = 176.0
+
+                chin_buf.append(raw_chin_y)
+                elbow_buf.append(raw_elbow)
+                knee_buf.append(raw_knee)
+                shoulder_y_buf.append(raw_shoulder_y)
+
+                chin_y = float(np.median(chin_buf))
+                mean_elbow_angle = float(np.median(elbow_buf))
+                mean_knee_angle = float(np.median(knee_buf))
+                shoulder_y = float(np.median(shoulder_y_buf))
 
                 angle_hip_l = calculate_angle(l_sh, l_hip, l_kn)
                 angle_hip_r = calculate_angle(r_sh, r_hip, r_kn)
                 mean_hip_angle = (angle_hip_l + angle_hip_r) / 2.0
 
-                shoulder_width = max(0.06, abs(l_sh[0] - r_sh[0]))
+                # Фиксируем эталонную ширину плеч в висе
+                curr_sh_w = abs(l_sh[0] - r_sh[0])
+                if mean_elbow_angle > 160.0 and curr_sh_w > 0.05 and len(shoulder_w_samples) < 60:
+                    shoulder_w_samples.append(curr_sh_w)
+                    base_shoulder_w = float(np.median(shoulder_w_samples))
 
-                # Устойчивые критерии нарушений с защитой от бокового ракурса камеры:
-                # 1. Явный перекос плеч и локтей по высоте + разница углов в средней фазе тяги
-                shoulder_tilt = abs(l_sh[1] - r_sh[1]) / shoulder_width
+                shoulder_tilt = abs(l_sh[1] - r_sh[1]) / max(0.08, base_shoulder_w)
                 elbow_diff = abs(angle_el_l - angle_el_r)
                 is_asym_frame = (
-                    (60.0 < mean_elbow_angle < 145.0)
-                    and (elbow_diff > 38.0)
-                    and (shoulder_tilt > 0.35)
+                    (65.0 < mean_elbow_angle < 140.0)
+                    and (elbow_diff > 40.0)
+                    and (shoulder_tilt > 0.38)
                 )
 
-                # 2. Сгибание коленей и скрещивание/разведение стоп
                 ankle_dist = abs(l_an[0] - r_an[0])
-                legs_crossed = (l_an[0] - r_an[0]) * (l_hip[0] - r_hip[0]) < -0.015
-                feet_apart = ankle_dist > (shoulder_width * 1.15)
-                knees_bent = mean_knee_angle < 150.0
+                legs_crossed = (l_an[0] - r_an[0]) * (l_hip[0] - r_hip[0]) < -0.02
+                feet_apart = ankle_dist > (base_shoulder_w * 1.45)
+                knees_bent = (kn_vis > 0.55) and (mean_knee_angle < 145.0)
 
-                # 3. Рывки и махи (сильное сгибание в тазу или раскачка корпуса)
                 hip_center_x = (l_hip[0] + r_hip[0]) / 2.0
-                horizontal_swing = abs(hip_center_x - wrist_x) > (shoulder_width * 0.95)
-                kipping_detected = (mean_hip_angle < 142.0) or horizontal_swing
+                horizontal_swing = abs(hip_center_x - wrist_x) > (base_shoulder_w * 1.10)
+                kipping_detected = (mean_hip_angle < 138.0) or horizontal_swing
 
-                # Проверка, что руки находятся на перекладине (участник не спрыгнул на землю)
-                hands_on_bar = abs(wrist_y - bar_y) < 0.14
+                hands_on_bar = abs(wrist_y - bar_y) < 0.15
 
-                if state == "WAIT_HANG":
+                # Строгий критерий взятия высоты в текущем кадре:
+                # 1) Подбородок выше линии грифа (с минимальным допуском 1.2% экрана)
+                # 2) Локти согнуты (<= 65 градусов)
+                # 3) Плечи поднялись близко к перекладине
+                chin_above_now = (
+                    (chin_y <= bar_y + 0.012)
+                    and (mean_elbow_angle <= 65.0)
+                    and (shoulder_y <= bar_y + 0.14)
+                )
+
+                # Если видео началось, когда атлет уже в верхней точке первого повторения (как на 00:00)
+                if frame_idx <= 5 and state == "WAIT_HANG" and mean_elbow_angle < 60.0 and hands_on_bar:
+                    state = "DESCENDING"
+                    rep_start_time = 0.0
+                    min_elbow_in_rep = mean_elbow_angle
+                    min_shoulder_y_in_rep = shoulder_y
+                    chin_above_frames = 3 if chin_above_now else 0
+                    rep_errors = set()
+                    rep_frames = 1
+                    asym_frames = knee_bent_frames = legs_crossed_frames = kipping_frames = 0
+
+                elif state == "WAIT_HANG":
                     if mean_elbow_angle >= elbow_ext_angle and hands_on_bar:
                         if hang_start_time is None:
                             hang_start_time = current_time
                         last_hang_duration = current_time - hang_start_time
                     else:
-                        if mean_elbow_angle < 150.0 and chin_y > bar_y and hands_on_bar:
+                        # Переход в подъем только при реальном сгибании рук (< 142 градусов)
+                        if mean_elbow_angle < 142.0 and hands_on_bar:
                             state = "PULLING"
                             rep_start_time = current_time
-                            min_chin_y = chin_y
                             min_elbow_in_rep = mean_elbow_angle
+                            min_shoulder_y_in_rep = shoulder_y
+                            chin_above_frames = 1 if chin_above_now else 0
                             rep_errors = set()
-                            rep_frames = 0
-                            asym_frames = 0
-                            knee_bent_frames = 0
-                            legs_crossed_frames = 0
-                            kipping_frames = 0
+                            rep_frames = 1
+                            asym_frames = knee_bent_frames = legs_crossed_frames = kipping_frames = 0
 
-                            # Если это самое первое повторение на первых 2 секундах видео,
-                            # не штрафуем за позднее включение камеры оператором
                             is_first_rep_early = (len(reps_log) == 0 and rep_start_time < 2.0)
                             if not is_first_rep_early and last_hang_duration < min_hang_sec:
                                 rep_errors.add(f"фиксация ИП менее 1.0 сек ({last_hang_duration:.2f} с)")
                             hang_start_time = None
 
                 elif state in ("PULLING", "DESCENDING"):
-                    # Если участник отпустил перекладину и спрыгнул вниз — отменяем ложную попытку
                     if not hands_on_bar:
                         state = "WAIT_HANG"
                         hang_start_time = None
                         last_hang_duration = 0.0
                     else:
                         rep_frames += 1
-                        min_chin_y = min(min_chin_y, chin_y)
                         min_elbow_in_rep = min(min_elbow_in_rep, mean_elbow_angle)
+                        min_shoulder_y_in_rep = min(min_shoulder_y_in_rep, shoulder_y)
+                        if chin_above_now:
+                            chin_above_frames += 1
 
                         if is_asym_frame:
                             asym_frames += 1
@@ -419,26 +460,31 @@ def analyze_video_pose(
                         if kipping_detected:
                             kipping_frames += 1
 
-                        if state == "PULLING" and (chin_y > min_chin_y + 0.03 or mean_elbow_angle < 105.0):
+                        # Переход к фазе опускания после прохождения пика подъема
+                        if state == "PULLING" and (
+                            mean_elbow_angle > min_elbow_in_rep + 12.0
+                            or shoulder_y > min_shoulder_y_in_rep + 0.03
+                        ):
                             state = "DESCENDING"
 
-                        if state == "DESCENDING" and mean_elbow_angle >= (elbow_ext_angle - 4.0):
+                        if state == "DESCENDING" and mean_elbow_angle >= (elbow_ext_angle - 3.0):
                             rep_duration = current_time - rep_start_time
 
-                            # Фильтруем случайные микродвижения короче 0.55 сек без реального подъема
-                            if rep_duration >= 0.55 and min_elbow_in_rep < 135.0:
-                                min_f = max(4, int(rep_frames * 0.30))
+                            # Считаем попыткой только движение, где локти сгибались сильнее 125 градусов
+                            # (отсекает покачивания в висе на 00:30 и 00:41)
+                            if rep_duration >= 0.50 and min_elbow_in_rep <= 125.0:
+                                min_f = max(5, int(rep_frames * 0.35))
                                 if asym_frames >= min_f:
                                     rep_errors.add("поочередное (неравномерное) сгибание рук")
-                                if knee_bent_frames >= min_f:
+                                if knee_bent_frames >= max(4, int(rep_frames * 0.25)):
                                     rep_errors.add("нарушение ИП: согнутые в коленях ноги")
                                 if legs_crossed_frames >= min_f:
                                     rep_errors.add("нарушение ИП: перекрещенные или разведенные ноги")
-                                if kipping_frames >= max(3, int(rep_frames * 0.25)):
+                                if kipping_frames >= max(4, int(rep_frames * 0.28)):
                                     rep_errors.add("подтягивание рывками или с махом ногами/туловищем")
 
-                                # Допуск 0.025 (2.5% высоты кадра) учитывает толщину кистей на грифе
-                                if min_chin_y > (bar_y + 0.025):
+                                # Для зачета высоты требуется минимум 2 подтвержденных кадра в верхней точке
+                                if chin_above_frames < 2:
                                     rep_errors.add("подбородок ниже уровня грифа перекладины")
 
                                 is_valid = len(rep_errors) == 0
@@ -468,7 +514,7 @@ def analyze_video_pose(
                     elbow_deg=mean_elbow_angle,
                     knee_deg=mean_knee_angle,
                     bar_y=bar_y,
-                    chin_y=chin_y,
+                    chin_above_now=chin_above_now,
                     active_errors=bool(rep_errors) if state != "WAIT_HANG" else False
                 )
                 writer.write(frame)
