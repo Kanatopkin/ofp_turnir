@@ -1,9 +1,72 @@
+import os
+import tempfile
+import urllib.request
 import cv2
 import mediapipe as mp
 import numpy as np
 
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+)
+
+# Индексы ключевых точек BlazePose (одинаковы для Tasks API и Solutions API)
+class LM:
+    NOSE = 0
+    MOUTH_LEFT = 9
+    MOUTH_RIGHT = 10
+    LEFT_SHOULDER = 11
+    RIGHT_SHOULDER = 12
+    LEFT_ELBOW = 13
+    RIGHT_ELBOW = 14
+    LEFT_WRIST = 15
+    RIGHT_WRIST = 16
+    LEFT_HIP = 23
+    RIGHT_HIP = 24
+    LEFT_KNEE = 25
+    RIGHT_KNEE = 26
+    LEFT_ANKLE = 27
+    RIGHT_ANKLE = 28
+
+POSE_CONNECTIONS = [
+    (LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER),
+    (LM.LEFT_SHOULDER, LM.LEFT_ELBOW),
+    (LM.LEFT_ELBOW, LM.LEFT_WRIST),
+    (LM.RIGHT_SHOULDER, LM.RIGHT_ELBOW),
+    (LM.RIGHT_ELBOW, LM.RIGHT_WRIST),
+    (LM.LEFT_SHOULDER, LM.LEFT_HIP),
+    (LM.RIGHT_SHOULDER, LM.RIGHT_HIP),
+    (LM.LEFT_HIP, LM.RIGHT_HIP),
+    (LM.LEFT_HIP, LM.LEFT_KNEE),
+    (LM.LEFT_KNEE, LM.LEFT_ANKLE),
+    (LM.RIGHT_HIP, LM.RIGHT_KNEE),
+    (LM.RIGHT_KNEE, LM.RIGHT_ANKLE),
+]
+
+
+def ensure_model_path():
+    """Скачивает официальную модель MediaPipe Pose Landmarker во временную папку при первом запуске."""
+    model_path = os.path.join(tempfile.gettempdir(), "pose_landmarker_lite.task")
+    if not os.path.exists(model_path):
+        urllib.request.urlretrieve(MODEL_URL, model_path)
+    return model_path
+
+
+def draw_skeleton(frame, landmarks):
+    """Отрисовывает ключевые точки и соединения скелета средствами OpenCV."""
+    h, w, _ = frame.shape
+    for idx_a, idx_b in POSE_CONNECTIONS:
+        pt1 = (int(landmarks[idx_a].x * w), int(landmarks[idx_a].y * h))
+        pt2 = (int(landmarks[idx_b].x * w), int(landmarks[idx_b].y * h))
+        cv2.line(frame, pt1, pt2, (255, 200, 0), 2)
+    for idx in [
+        LM.NOSE, LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER,
+        LM.LEFT_ELBOW, LM.RIGHT_ELBOW, LM.LEFT_WRIST, LM.RIGHT_WRIST,
+        LM.LEFT_HIP, LM.RIGHT_HIP, LM.LEFT_KNEE, LM.RIGHT_KNEE,
+        LM.LEFT_ANKLE, LM.RIGHT_ANKLE
+    ]:
+        cx, cy = int(landmarks[idx].x * w), int(landmarks[idx].y * h)
+        cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1)
 
 
 def calculate_angle(a, b, c):
@@ -32,24 +95,34 @@ def get_calibration_preview(video_path, manual_bar_y=None):
     """
     cap = cv2.VideoCapture(video_path)
     ret, frame = cap.read()
+    cap.release()
     if not ret:
-        cap.release()
         return None, 0.25
 
     h, w, _ = frame.shape
     detected_bar_y = 0.25
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = pose.process(rgb)
+    model_path = ensure_model_path()
+    BaseOptions = mp.tasks.BaseOptions
+    PoseLandmarker = mp.tasks.vision.PoseLandmarker
+    PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+
+    options = PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.IMAGE
+    )
+    with PoseLandmarker.create_from_options(options) as landmarker:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        res = landmarker.detect(mp_image)
         if res.pose_landmarks:
-            lm = res.pose_landmarks.landmark
-            lw_y = lm[mp_pose.PoseLandmark.LEFT_WRIST].y
-            rw_y = lm[mp_pose.PoseLandmark.RIGHT_WRIST].y
+            lm = res.pose_landmarks[0]
+            lw_y = lm[LM.LEFT_WRIST].y
+            rw_y = lm[LM.RIGHT_WRIST].y
             detected_bar_y = float((lw_y + rw_y) / 2.0)
-            mp_drawing.draw_landmarks(frame, res.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            draw_skeleton(frame, lm)
 
-    cap.release()
     bar_y = manual_bar_y if manual_bar_y is not None else detected_bar_y
     bar_px = int(bar_y * h)
 
@@ -70,7 +143,7 @@ def analyze_video_pose(
     progress_callback=None
 ):
     """
-    Покадровый анализ видео на основе MediaPipe Pose и конечного автомата (State Machine).
+    Покадровый анализ видео на основе MediaPipe PoseLandmarker и конечного автомата (State Machine).
     """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -93,13 +166,23 @@ def analyze_video_pose(
 
     reps_log = []
     frame_idx = 0
+    last_ts_ms = -1
 
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        min_detection_confidence=0.5,
+    model_path = ensure_model_path()
+    BaseOptions = mp.tasks.BaseOptions
+    PoseLandmarker = mp.tasks.vision.PoseLandmarker
+    PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+
+    options = PoseLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.VIDEO,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5
-    ) as pose:
+    )
+
+    with PoseLandmarker.create_from_options(options) as landmarker:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -107,32 +190,35 @@ def analyze_video_pose(
 
             frame_idx += 1
             current_time = frame_idx / fps
+            ts_ms = max(last_ts_ms + 1, int(round(current_time * 1000)))
+            last_ts_ms = ts_ms
 
             if progress_callback and total_frames > 0 and frame_idx % 10 == 0:
                 progress_callback(min(1.0, frame_idx / total_frames))
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(rgb)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            results = landmarker.detect_for_video(mp_image, ts_ms)
 
             if not results.pose_landmarks:
                 continue
 
-            lm = results.pose_landmarks.landmark
+            lm = results.pose_landmarks[0]
 
-            def pt(landmark_enum):
-                p = lm[landmark_enum]
+            def pt(idx):
+                p = lm[idx]
                 return [p.x, p.y]
 
-            l_sh, r_sh = pt(mp_pose.PoseLandmark.LEFT_SHOULDER), pt(mp_pose.PoseLandmark.RIGHT_SHOULDER)
-            l_el, r_el = pt(mp_pose.PoseLandmark.LEFT_ELBOW), pt(mp_pose.PoseLandmark.RIGHT_ELBOW)
-            l_wr, r_wr = pt(mp_pose.PoseLandmark.LEFT_WRIST), pt(mp_pose.PoseLandmark.RIGHT_WRIST)
-            l_hip, r_hip = pt(mp_pose.PoseLandmark.LEFT_HIP), pt(mp_pose.PoseLandmark.RIGHT_HIP)
-            l_kn, r_kn = pt(mp_pose.PoseLandmark.LEFT_KNEE), pt(mp_pose.PoseLandmark.RIGHT_KNEE)
-            l_an, r_an = pt(mp_pose.PoseLandmark.LEFT_ANKLE), pt(mp_pose.PoseLandmark.RIGHT_ANKLE)
+            l_sh, r_sh = pt(LM.LEFT_SHOULDER), pt(LM.RIGHT_SHOULDER)
+            l_el, r_el = pt(LM.LEFT_ELBOW), pt(LM.RIGHT_ELBOW)
+            l_wr, r_wr = pt(LM.LEFT_WRIST), pt(LM.RIGHT_WRIST)
+            l_hip, r_hip = pt(LM.LEFT_HIP), pt(LM.RIGHT_HIP)
+            l_kn, r_kn = pt(LM.LEFT_KNEE), pt(LM.RIGHT_KNEE)
+            l_an, r_an = pt(LM.LEFT_ANKLE), pt(LM.RIGHT_ANKLE)
 
-            nose = pt(mp_pose.PoseLandmark.NOSE)
-            m_l = pt(mp_pose.PoseLandmark.MOUTH_LEFT)
-            m_r = pt(mp_pose.PoseLandmark.MOUTH_RIGHT)
+            nose = pt(LM.NOSE)
+            m_l = pt(LM.MOUTH_LEFT)
+            m_r = pt(LM.MOUTH_RIGHT)
             mouth_y = (m_l[1] + m_r[1]) / 2.0
             chin_y = mouth_y + 0.35 * abs(mouth_y - nose[1])
 
