@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import io
 import os
+import ssl
 import tempfile
 import time
 from datetime import datetime
@@ -21,8 +22,9 @@ st.set_page_config(
 
 DB_FILENAME = "tournament_db.json"
 
-@st.cache_resource
+
 def get_drive_service():
+    """Создает свежее подключение к Google Drive API для предотвращения SSL RECORD_LAYER_FAILURE."""
     if "gdrive_oauth" in st.secrets:
         creds = Credentials(
             token=None,
@@ -37,65 +39,95 @@ def get_drive_service():
         creds = service_account.Credentials.from_service_account_info(
             creds_info, scopes=["https://www.googleapis.com/auth/drive"]
         )
-    return build("drive", "v3", credentials=creds)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def retry_drive_op(func, retries=3, delay=1.0):
+    """Выполняет операцию Google Drive с автоматическим переподключением при сбоях SSL/сети."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return func()
+        except (ssl.SSLError, OSError, Exception) as e:
+            last_err = e
+            time.sleep(delay * (attempt + 1))
+    raise last_err
+
 
 def load_db():
-    service = get_drive_service()
-    folder_id = st.secrets["general"]["drive_folder_id"]
-    query = f"'{folder_id}' in parents and name = '{DB_FILENAME}' and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get("files", [])
-    if not files:
-        return []
-    request = service.files().get_media(fileId=files[0]["id"])
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    fh.seek(0)
-    return json.loads(fh.read().decode("utf-8"))
+    def _op():
+        service = get_drive_service()
+        folder_id = st.secrets["general"]["drive_folder_id"]
+        query = f"'{folder_id}' in parents and name = '{DB_FILENAME}' and trashed = false"
+        results = service.files().list(q=query, fields="files(id, name)").execute(num_retries=3)
+        files = results.get("files", [])
+        if not files:
+            return []
+        request = service.files().get_media(fileId=files[0]["id"])
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk(num_retries=3)
+        fh.seek(0)
+        return json.loads(fh.read().decode("utf-8"))
+
+    return retry_drive_op(_op)
+
 
 def save_db(data):
-    service = get_drive_service()
-    folder_id = st.secrets["general"]["drive_folder_id"]
-    query = f"'{folder_id}' in parents and name = '{DB_FILENAME}' and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get("files", [])
-    json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-    media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype="application/json", resumable=True)
-    if files:
-        service.files().update(fileId=files[0]["id"], media_body=media).execute()
-    else:
-        file_metadata = {"name": DB_FILENAME, "parents": [folder_id]}
-        service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    def _op():
+        service = get_drive_service()
+        folder_id = st.secrets["general"]["drive_folder_id"]
+        query = f"'{folder_id}' in parents and name = '{DB_FILENAME}' and trashed = false"
+        results = service.files().list(q=query, fields="files(id, name)").execute(num_retries=3)
+        files = results.get("files", [])
+        json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype="application/json", resumable=True)
+        if files:
+            service.files().update(fileId=files[0]["id"], media_body=media).execute(num_retries=3)
+        else:
+            file_metadata = {"name": DB_FILENAME, "parents": [folder_id]}
+            service.files().create(body=file_metadata, media_body=media, fields="id").execute(num_retries=3)
+
+    return retry_drive_op(_op)
+
 
 def upload_video_to_drive(uploaded_file, filename):
-    service = get_drive_service()
-    folder_id = st.secrets["general"]["drive_folder_id"]
-    file_metadata = {"name": filename, "parents": [folder_id]}
-    media = MediaIoBaseUpload(uploaded_file, mimetype=uploaded_file.type, resumable=True)
-    file = service.files().create(
-        body=file_metadata, media_body=media, fields="id, webViewLink"
-    ).execute()
-    try:
-        service.permissions().create(
-            fileId=file["id"], body={"type": "anyone", "role": "reader"}
-        ).execute()
-    except Exception:
-        pass
-    return file["id"], file["webViewLink"]
+    def _op():
+        service = get_drive_service()
+        folder_id = st.secrets["general"]["drive_folder_id"]
+        file_metadata = {"name": filename, "parents": [folder_id]}
+        uploaded_file.seek(0)
+        media = MediaIoBaseUpload(uploaded_file, mimetype=uploaded_file.type, resumable=True)
+        file = service.files().create(
+            body=file_metadata, media_body=media, fields="id, webViewLink"
+        ).execute(num_retries=3)
+        try:
+            service.permissions().create(
+                fileId=file["id"], body={"type": "anyone", "role": "reader"}
+            ).execute(num_retries=2)
+        except Exception:
+            pass
+        return file["id"], file["webViewLink"]
+
+    return retry_drive_op(_op)
+
 
 def download_video_temp(file_id):
-    service = get_drive_service()
-    request = service.files().get_media(fileId=file_id)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    downloader = MediaIoBaseDownload(tmp, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    tmp.close()
-    return tmp.name
+    def _op():
+        service = get_drive_service()
+        request = service.files().get_media(fileId=file_id)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        downloader = MediaIoBaseDownload(tmp, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk(num_retries=3)
+        tmp.close()
+        return tmp.name
+
+    return retry_drive_op(_op)
+
 
 if "db" not in st.session_state:
     try:
@@ -103,6 +135,9 @@ if "db" not in st.session_state:
     except Exception as e:
         st.session_state.db = []
         st.warning(f"Ожидание настройки подключения к Google Drive в Secrets: {e}")
+
+if "tracked_videos" not in st.session_state:
+    st.session_state.tracked_videos = {}
 
 st.title("🏆 Турнир по подтягиванию на перекладине памяти героев СВО")
 st.markdown(
@@ -163,7 +198,14 @@ with col_reg:
                         st.success(f"Участник {fio} зарегистрирован! Видео загружено в Google Drive.")
 
 with col_board:
-    st.subheader("📊 Онлайн-табло результатов")
+    col_title, col_sync = st.columns([3, 1])
+    with col_title:
+        st.subheader("📊 Онлайн-табло результатов")
+    with col_sync:
+        if st.button("🔄 Обновить", use_container_width=True):
+            st.session_state.db = load_db()
+            st.rerun()
+
     if not st.session_state.db:
         st.info("Заявки пока не поступали.")
     else:
@@ -233,7 +275,7 @@ if judge_pwd:
                     f"{'🟢' if entry['status']=='Проверено' else '🟡'} {entry['school']} — {entry['fio']} ({entry['grade']}) | "
                     f"Заявлено: {entry['claimed_reps']} | Засчитано: {entry['verified_reps'] if entry['verified_reps'] is not None else '—'}"
                 ):
-                    col_left, col_right = st.columns([1.1, 1.4])
+                    col_left, col_right = st.columns([1.2, 1.3])
 
                     with col_left:
                         st.markdown(f"🔗 **[Открыть исходное видео в Google Drive]({entry['video_url']})**")
@@ -266,14 +308,15 @@ if judge_pwd:
                                             os.remove(tmp_path)
 
                         with b_run:
-                            if st.button("🤖 Запустить Pose-анализ", key=f"pose_{entry['id']}", use_container_width=True):
-                                prog_bar = st.progress(0.0, text="Покадровая обработка MediaPipe Pose...")
+                            if st.button("🤖 Анализ + Видео с трекингом", key=f"pose_{entry['id']}", use_container_width=True):
+                                prog_bar = st.progress(0.0, text="Покадровая обработка и запись видео со скелетом...")
                                 tmp_path = download_video_temp(entry["file_id"])
                                 try:
                                     res = analyze_video_pose(
                                         tmp_path,
                                         manual_bar_y=manual_bar_val,
-                                        progress_callback=lambda p: prog_bar.progress(p, text=f"Анализ кадров: {int(p*100)}%")
+                                        generate_tracked_video=True,
+                                        progress_callback=lambda p: prog_bar.progress(p, text=f"Трекинг ключевых точек: {int(p*100)}%")
                                     )
                                     prog_bar.empty()
                                     entry["verified_reps"] = res["valid_reps"]
@@ -281,11 +324,31 @@ if judge_pwd:
                                     entry["errors"] = res["errors"]
                                     entry["reps_detail"] = res["reps_detail"]
                                     entry["comment"] = res["comment"]
+
+                                    if res.get("tracked_video_path") and os.path.exists(res["tracked_video_path"]):
+                                        with open(res["tracked_video_path"], "rb") as vf:
+                                            st.session_state.tracked_videos[entry["id"]] = vf.read()
+                                        os.remove(res["tracked_video_path"])
+
                                     save_db(st.session_state.db)
                                     st.rerun()
                                 finally:
                                     if os.path.exists(tmp_path):
                                         os.remove(tmp_path)
+
+                        # Встроенный видеоплеер с трекингом ключевых точек для судьи
+                        if entry["id"] in st.session_state.tracked_videos:
+                            st.markdown("🎬 **Видеозапись с трекингом ключевых точек (MediaPipe Pose):**")
+                            video_bytes = st.session_state.tracked_videos[entry["id"]]
+                            st.video(video_bytes)
+                            st.download_button(
+                                label="💾 Скачать видео с трекингом (.mp4)",
+                                data=video_bytes,
+                                file_name=f"Tracking_{entry['school']}_{entry['fio']}.mp4",
+                                mime="video/mp4",
+                                key=f"dl_vid_{entry['id']}",
+                                use_container_width=True
+                            )
 
                         if entry.get("reps_detail"):
                             st.markdown("**Протокол повторений по таймкодам:**")
@@ -305,7 +368,7 @@ if judge_pwd:
                         judge_comment = st.text_area(
                             "Детальный лог по таймкодам и комментарий судьи:",
                             value=entry.get("comment", ""),
-                            height=180,
+                            height=220,
                             key=f"comm_{entry['id']}"
                         )
 
