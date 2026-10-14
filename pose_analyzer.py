@@ -13,6 +13,68 @@ MODEL_URL = (
     "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
 )
 
+# =====================================================================
+# КОНФИГУРАТОР ПАРАМЕТРОВ И ОГРАНИЧЕНИЙ АЛГОРИТМА (П. 1 - 26)
+# =====================================================================
+CONFIG = {
+    # 1. Фиксация ИП перед стартом (с)
+    "min_hang_sec": 0.85,
+    # 2. Угол локтей в нижнем висе (градусы)
+    "elbow_ext_angle": 168.0,
+    # 3. Вис на полусогнутых руках перед стартом (с)
+    "pre_bend_max_time": 0.55,
+    # 4. Порог начала движения / старт тяги (градусы)
+    "pull_start_angle": 148.0,
+    # 5. Минимальная глубина движения (градусы)
+    "min_pull_depth_angle": 135.0,
+    # 6. Минимальная длительность попытки (с)
+    "min_rep_duration": 0.45,
+    # 7. Допуск высоты подбородка относительно грифа (доля высоты кадра)
+    "chin_bar_tolerance": 0.005,
+    # 8. Максимальный угол локтей в пике (градусы)
+    "max_peak_elbow_angle": 45.0,
+    # 9. Высота носа над грифом (доля высоты кадра)
+    "nose_bar_margin": -0.015,
+    # 10. Число подтвержденных кадров пика
+    "min_chin_above_frames": 1,
+    # 11. Порог прямоты ног / 2D-угол в коленях (градусы)
+    "knee_bent_threshold": 140.0,
+    # 12. Порог захлеста голеней назад 3D (доля длины бедра)
+    "shin_ratio_threshold": 0.66,
+    # 13. Длительность ошибки согнутых коленей (25% кадров, мин. 5 кадров)
+    "knee_err_frame_ratio": 0.25,
+    "knee_err_min_frames": 5,
+    # 14. Порог скрещивания ног / X-перехлест
+    "cross_product_threshold": -0.00001,
+    # 15. Длительность ошибки скрещивания (мин. 5 кадров)
+    "cross_err_min_frames": 5,
+    # 16. Разведение ног / ступни не вместе (125% ширины плеч)
+    "feet_apart_ratio": 1.25,
+    # 17. Длительность разведения ног (30% кадров, мин. 5 кадров)
+    "feet_apart_frame_ratio": 0.30,
+    "feet_apart_min_frames": 5,
+    # 18. Рывок тазом / угол в тазобедренном суставе (градусы)
+    "hip_kipping_angle": 156.0,
+    # 19. Горизонтальный вынос таза (72% ширины плеч)
+    "hip_swing_ratio": 0.72,
+    # 20. Вынос стоп от таза / мах ногами (70% ширины плеч)
+    "ankle_swing_ratio": 0.70,
+    # 21. Длительность ошибки маха/рывка (30% кадров, мин. 6 кадров)
+    "kipping_frame_ratio": 0.30,
+    "kipping_min_frames": 6,
+    # 22. Асимметрия: чистая разница углов в локтях сверх калибровки (градусы)
+    "asym_elbow_diff_deg": 22.0,
+    # 23. Асимметрия: перекос линии локтей (20% ширины плеч)
+    "asym_elbow_tilt_ratio": 0.20,
+    # 24. Асимметрия: перекос линии плеч (20% ширины плеч)
+    "asym_shoulder_tilt_ratio": 0.20,
+    # 25. Длительность поочередного сгибания рук (20% кадров, мин. 5 кадров)
+    "asym_frame_ratio": 0.20,
+    "asym_min_frames": 5,
+    # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
+    "bar_release_dist": 0.16,
+}
+
 
 class LM:
     NOSE = 0
@@ -73,7 +135,6 @@ def format_timestamp(seconds):
 
 
 def compute_bar_y_from_hands(lm):
-    """Определяет уровень грифа по верхней части хвата кистей."""
     knuckle_y = min(
         (lm[LM.LEFT_INDEX].y + lm[LM.RIGHT_INDEX].y) / 2.0,
         (lm[LM.LEFT_PINKY].y + lm[LM.RIGHT_PINKY].y) / 2.0
@@ -187,8 +248,8 @@ def convert_to_web_mp4(raw_video_path):
 def analyze_video_pose(
     video_path,
     manual_bar_y=None,
-    elbow_ext_angle=168.0,
-    min_hang_sec=0.85,
+    elbow_ext_angle=CONFIG["elbow_ext_angle"],
+    min_hang_sec=CONFIG["min_hang_sec"],
     generate_tracked_video=True,
     progress_callback=None
 ):
@@ -258,9 +319,9 @@ def analyze_video_pose(
         knee_buf = deque(maxlen=3)
         shoulder_y_buf = deque(maxlen=3)
 
-        # Буферы контроля ИП в висе перед началом тяги (~0.7 с)
-        pre_pull_knee_err = deque(maxlen=20)
-        pre_pull_cross_err = deque(maxlen=20)
+        # Буферы контроля ИП в висе перед началом тяги
+        pre_pull_knee_err = deque(maxlen=25)
+        pre_pull_cross_err = deque(maxlen=25)
         pre_pull_swing_x = deque(maxlen=25)
 
         rep_start_time = 0.0
@@ -346,13 +407,13 @@ def analyze_video_pose(
                     angle_el_r = calculate_angle(r_sh, r_el, r_wr)
                     raw_elbow = (angle_el_l + angle_el_r) / 2.0
 
-                    # 1. Угол в коленях с учетом 3D-захлеста голеней назад (попытка № 5)
+                    # П. 11-12: угол в коленях и 3D-захлест голеней назад
                     angle_kn_2d = (calculate_angle(l_hip, l_kn, l_an) + calculate_angle(r_hip, r_kn, r_an)) / 2.0
                     thigh_len = (np.hypot(l_kn[0] - l_hip[0], l_kn[1] - l_hip[1]) + np.hypot(r_kn[0] - r_hip[0], r_kn[1] - r_hip[1])) / 2.0
                     shin_len = (np.hypot(l_an[0] - l_kn[0], l_an[1] - l_kn[1]) + np.hypot(r_an[0] - r_kn[0], r_an[1] - r_kn[1])) / 2.0
                     shin_ratio = shin_len / max(0.04, thigh_len)
 
-                    if shin_ratio < 0.66:
+                    if shin_ratio < CONFIG["shin_ratio_threshold"]:
                         sagittal_knee_deg = float(np.degrees(np.arcsin(np.clip(shin_ratio / 0.85, 0.1, 1.0))) * 1.6)
                         raw_knee = min(angle_kn_2d, sagittal_knee_deg)
                     else:
@@ -376,7 +437,7 @@ def analyze_video_pose(
                     ankle_center_y = (l_an[1] + r_an[1]) / 2.0
                     curr_body_len = max(0.20, ankle_center_y - shoulder_y)
 
-                    # Калибровка индивидуальной геометрии спортсмена в спокойном висе
+                    # Калибровка геометрии спортсмена в спокойном висе
                     if mean_elbow_angle >= 170.0 and curr_sh_w > 0.05 and len(shoulder_w_samples) < 50:
                         shoulder_w_samples.append(curr_sh_w)
                         base_shoulder_w = float(np.median(shoulder_w_samples))
@@ -392,7 +453,7 @@ def analyze_video_pose(
                         base_head_off = float(np.median(base_head_off_samples))
                         base_body_len = float(np.median(base_body_len_samples))
 
-                    # 2. Детекция неравномерного (поочередного) сгибания рук (попытка № 9)
+                    # П. 22-24: детекция асимметрии / поочередного сгибания рук
                     curr_sh_tilt = abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w)
                     curr_el_tilt = abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w)
                     curr_head_off = (mouth_x - wrist_x) / max(0.06, base_shoulder_w)
@@ -406,14 +467,14 @@ def analyze_video_pose(
                     is_asym_frame = (
                         (25.0 < mean_elbow_angle < 155.0)
                         and (
-                            net_el_tilt > 0.14
-                            or net_sh_tilt > 0.13
-                            or (net_el_diff > 15.0 and net_el_tilt > 0.08)
-                            or (net_head_shift > 0.13 and (net_el_tilt > 0.08 or net_el_diff > 10.0))
+                            net_el_tilt > CONFIG["asym_elbow_tilt_ratio"]
+                            or net_sh_tilt > CONFIG["asym_shoulder_tilt_ratio"]
+                            or (net_el_diff > CONFIG["asym_elbow_diff_deg"] and net_el_tilt > 0.08)
+                            or (net_head_shift > 0.16 and net_el_diff > CONFIG["asym_elbow_diff_deg"] * 0.7)
                         )
                     )
 
-                    # 3. Детекция перекрещенных ног (попытка № 8: Х-пересечение голеней или наложение лодыжек)
+                    # П. 11, 12, 14, 16: положение ног и стоп
                     ankle_dx = l_an[0] - r_an[0]
                     knee_dx = l_kn[0] - r_kn[0]
                     hip_dx = l_hip[0] - r_hip[0]
@@ -422,7 +483,10 @@ def analyze_video_pose(
                     knee_dist = abs(knee_dx)
                     ankle_dy = abs(l_an[1] - r_an[1])
 
-                    shins_crossed_x = (ankle_dx * knee_dx < -0.00001) or (ankle_dx * hip_dx < -0.00001)
+                    shins_crossed_x = (
+                        (ankle_dx * knee_dx < CONFIG["cross_product_threshold"])
+                        or (ankle_dx * hip_dx < CONFIG["cross_product_threshold"])
+                    )
                     ankles_overlapped = (
                         knee_dist > hip_w * 0.45
                         and ankle_dist < knee_dist * 0.45
@@ -430,28 +494,34 @@ def analyze_video_pose(
                     )
                     legs_crossed = shins_crossed_x or ankles_overlapped
 
-                    feet_apart = ankle_dist > (base_shoulder_w * 1.15)
-                    knees_bent = (mean_knee_angle < 154.0) or (shin_ratio < 0.66)
+                    feet_apart = ankle_dist > (base_shoulder_w * CONFIG["feet_apart_ratio"])
+                    knees_bent = (
+                        (mean_knee_angle < CONFIG["knee_bent_threshold"])
+                        or (shin_ratio < CONFIG["shin_ratio_threshold"])
+                    )
 
-                    # 4. Детекция рывков и махов ногами/туловищем (попытки № 4, 6)
+                    # П. 18-20: детекция рывков и махов ногами/туловищем
                     hip_center_x = (l_hip[0] + r_hip[0]) / 2.0
                     ankle_center_x = (l_an[0] + r_an[0]) / 2.0
                     horizontal_swing = (
-                        abs(hip_center_x - wrist_x) > (base_shoulder_w * 0.72)
-                        or abs(ankle_center_x - hip_center_x) > (base_shoulder_w * 0.60)
+                        abs(hip_center_x - wrist_x) > (base_shoulder_w * CONFIG["hip_swing_ratio"])
+                        or abs(ankle_center_x - hip_center_x) > (base_shoulder_w * CONFIG["ankle_swing_ratio"])
                     )
-                    # Укорочение вертикальной проекции тела при махе ногами/тазом вперед на камеру
                     body_foreshortened = (not knees_bent) and (curr_body_len < base_body_len * 0.89)
-                    kipping_detected = (mean_hip_angle < 156.0) or horizontal_swing or body_foreshortened
+                    kipping_detected = (
+                        (mean_hip_angle < CONFIG["hip_kipping_angle"])
+                        or horizontal_swing
+                        or body_foreshortened
+                    )
 
-                    hands_on_bar = abs(wrist_y - bar_y) < 0.16
+                    # П. 26: проверка нахождения кистей на перекладине
+                    hands_on_bar = abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
 
-                    # 5. Строгий критерий взятия верхней точки:
-                    # подбородок достиг/пересек линию грифа, нос выше грифа, локти согнуты <= 50 градусов
+                    # П. 7, 8, 9: проверка взятия верхней точки
                     chin_above_now = (
-                        (chin_y <= bar_y + 0.005)
-                        and (nose_y <= bar_y - 0.015)
-                        and (mean_elbow_angle <= 50.0)
+                        (chin_y <= bar_y + CONFIG["chin_bar_tolerance"])
+                        and (nose_y <= bar_y + CONFIG["nose_bar_margin"])
+                        and (mean_elbow_angle <= CONFIG["max_peak_elbow_angle"])
                         and (shoulder_y <= bar_y + 0.12)
                     )
 
@@ -461,7 +531,7 @@ def analyze_video_pose(
                         min_elbow_in_rep = mean_elbow_angle
                         min_shoulder_y_in_rep = shoulder_y
                         min_chin_y_in_rep = chin_y
-                        chin_above_frames = 2 if chin_above_now else 0
+                        chin_above_frames = CONFIG["min_chin_above_frames"] if chin_above_now else 0
                         rep_errors = set()
                         rep_frames = 1
                         asym_frames = knee_bent_frames = legs_crossed_frames = feet_apart_frames = kipping_frames = 0
@@ -474,18 +544,19 @@ def analyze_video_pose(
                             pre_pull_cross_err.append(1 if legs_crossed else 0)
                             pre_pull_swing_x.append(ankle_center_x)
 
-                        # Полный вис на прямых руках (168-180 градусов)
+                        # П. 2: вис на выпрямленных руках
                         if mean_elbow_angle >= elbow_ext_angle and hands_on_bar:
                             if hang_start_time is None:
                                 hang_start_time = current_time
                             last_hang_duration = current_time - hang_start_time
                             pre_bend_frames = 0
                         else:
-                            # Считаем кадры нахождения на полусогнутых руках (148-168 градусов) перед рывком (попытка № 4)
-                            if 148.0 <= mean_elbow_angle < elbow_ext_angle and hands_on_bar:
+                            # П. 3: вис на полусогнутых руках перед стартом
+                            if CONFIG["pull_start_angle"] <= mean_elbow_angle < elbow_ext_angle and hands_on_bar:
                                 pre_bend_frames += 1
 
-                            if mean_elbow_angle < 148.0 and hands_on_bar:
+                            # П. 4: старт тяги
+                            if mean_elbow_angle < CONFIG["pull_start_angle"] and hands_on_bar:
                                 state = "PULLING"
                                 rep_start_time = current_time
                                 min_elbow_in_rep = mean_elbow_angle
@@ -502,16 +573,16 @@ def analyze_video_pose(
                                 rep_ankle_x = list(pre_pull_swing_x) + [ankle_center_x]
                                 rep_hip_x = [hip_center_x]
 
-                                # Если перед началом тяги спортсмен долго висел/раскачивался на полусогнутых руках (> 0.55 с, как на 00:21-00:22)
-                                if pre_bend_frames > int(0.55 * fps):
+                                if pre_bend_frames > int(CONFIG["pre_bend_max_time"] * fps):
                                     rep_errors.add("подтягивание рывками или с махом ногами/туловищем")
                                     rep_errors.add("нарушение ИП: согнутые в локтях руки перед стартом")
 
-                                if sum(pre_pull_knee_err) >= 5:
+                                if sum(pre_pull_knee_err) >= CONFIG["knee_err_min_frames"]:
                                     rep_errors.add("нарушение ИП: согнутые в коленях ноги")
-                                if sum(pre_pull_cross_err) >= 3:
+                                if sum(pre_pull_cross_err) >= CONFIG["cross_err_min_frames"]:
                                     rep_errors.add("нарушение ИП: перекрещенные ноги")
 
+                                # П. 1: контроль времени фиксации ИП
                                 is_first_rep_early = (len(reps_log) == 0 and rep_start_time < 2.0)
                                 if not is_first_rep_early and last_hang_duration < min_hang_sec:
                                     rep_errors.add(f"фиксация ИП менее 1.0 сек ({last_hang_duration:.2f} с)")
@@ -521,10 +592,10 @@ def analyze_video_pose(
 
                     elif state in ("PULLING", "DESCENDING"):
                         if not hands_on_bar:
-                            # Срыв / спрыгивание с турника до завершения опускания в вис (попытка № 5 у Иванова)
+                            # П. 26: срыв / спрыгивание с перекладины до фиксации виса
                             rep_duration = current_time - rep_start_time
                             if rep_duration >= 0.40 and min_elbow_in_rep <= 115.0:
-                                if chin_above_frames < 1:
+                                if chin_above_frames < CONFIG["min_chin_above_frames"]:
                                     rep_errors.add("подбородок ниже уровня грифа перекладины")
                                 rep_errors.add("срыв / спрыгивание с перекладины без фиксации виса")
                                 reps_log.append({
@@ -572,22 +643,39 @@ def analyze_video_pose(
 
                             if state == "DESCENDING" and mean_elbow_angle >= (elbow_ext_angle - 4.0):
                                 rep_duration = current_time - rep_start_time
-                                if rep_duration >= 0.45 and min_elbow_in_rep <= 135.0:
+
+                                # П. 5, 6: фильтрация по минимальной длительности и глубине сгибания локтей
+                                if (
+                                    rep_duration >= CONFIG["min_rep_duration"]
+                                    and min_elbow_in_rep <= CONFIG["min_pull_depth_angle"]
+                                ):
                                     ankle_swing_span = (max(rep_ankle_x) - min(rep_ankle_x)) if rep_ankle_x else 0.0
 
-                                    if asym_frames >= max(3, int(rep_frames * 0.16)):
+                                    # П. 25: длительность поочередного сгибания рук (20% кадров, мин. 5 кадров)
+                                    if asym_frames >= max(CONFIG["asym_min_frames"], int(rep_frames * CONFIG["asym_frame_ratio"])):
                                         rep_errors.add("поочередное (неравномерное) сгибание рук")
-                                    if knee_bent_frames >= max(3, int(rep_frames * 0.18)):
+
+                                    # П. 13: длительность ошибки согнутых коленей (25% кадров, мин. 5 кадров)
+                                    if knee_bent_frames >= max(CONFIG["knee_err_min_frames"], int(rep_frames * CONFIG["knee_err_frame_ratio"])):
                                         rep_errors.add("нарушение ИП: согнутые в коленях ноги")
-                                    if legs_crossed_frames >= 3:
+
+                                    # П. 15: длительность ошибки скрещивания ног (мин. 5 кадров)
+                                    if legs_crossed_frames >= CONFIG["cross_err_min_frames"]:
                                         rep_errors.add("нарушение ИП: перекрещенные ноги")
-                                    if feet_apart_frames >= max(5, int(rep_frames * 0.30)):
+
+                                    # П. 17: длительность разведения ног (30% кадров, мин. 5 кадров)
+                                    if feet_apart_frames >= max(CONFIG["feet_apart_min_frames"], int(rep_frames * CONFIG["feet_apart_frame_ratio"])):
                                         rep_errors.add("нарушение ИП: ступни не вместе (ноги разведены)")
-                                    if kipping_frames >= max(4, int(rep_frames * 0.22)) or ankle_swing_span > (base_shoulder_w * 0.65):
+
+                                    # П. 21: длительность ошибки маха/рывка (30% кадров, мин. 6 кадров)
+                                    if (
+                                        kipping_frames >= max(CONFIG["kipping_min_frames"], int(rep_frames * CONFIG["kipping_frame_ratio"]))
+                                        or ankle_swing_span > (base_shoulder_w * CONFIG["ankle_swing_ratio"])
+                                    ):
                                         rep_errors.add("подтягивание рывками или с махом ногами/туловищем")
 
-                                    # Безусловное требование взятия верхней точки (исправление попыток № 7 и № 9)
-                                    if chin_above_frames < 1:
+                                    # П. 10: число подтвержденных кадров пика
+                                    if chin_above_frames < CONFIG["min_chin_above_frames"]:
                                         rep_errors.add("подбородок ниже уровня грифа перекладины")
 
                                     is_valid = len(rep_errors) == 0
@@ -617,10 +705,10 @@ def analyze_video_pose(
                         state != "WAIT_HANG"
                         and (
                             bool(rep_errors)
-                            or knee_bent_frames >= 3
-                            or legs_crossed_frames >= 3
-                            or asym_frames >= 3
-                            or kipping_frames >= 4
+                            or knee_bent_frames >= CONFIG["knee_err_min_frames"]
+                            or legs_crossed_frames >= CONFIG["cross_err_min_frames"]
+                            or asym_frames >= CONFIG["asym_min_frames"]
+                            or kipping_frames >= CONFIG["kipping_min_frames"]
                         )
                     )
                     draw_hud(
