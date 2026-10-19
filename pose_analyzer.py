@@ -339,9 +339,9 @@ def analyze_video_pose(
         options = mp.tasks.vision.PoseLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            min_pose_detection_confidence=0.55,
-            min_pose_presence_confidence=0.55,
-            min_tracking_confidence=0.55
+            min_pose_detection_confidence=0.65,
+            min_pose_presence_confidence=0.65,
+            min_tracking_confidence=0.65
         )
 
         with mp.tasks.vision.PoseLandmarker.create_from_options(options) as landmarker:
