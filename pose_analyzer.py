@@ -1,9 +1,10 @@
+from collections import deque
+import math
 import os
 import shutil
 import subprocess
 import tempfile
 import urllib.request
-from collections import deque
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -14,11 +15,11 @@ MODEL_URL = (
 )
 
 # =====================================================================
-# КОНФИГУРАТОР ПАРАМЕТРОВ И ОГРАНИЧЕНИЙ АЛГОРИТМА (П. 1 - 26)
+# КОНФИГУРАТОР ПАРАМЕТРОВ И ОГРАНИЧЕНИЙ АЛГОРИТМА (П. 1 - 26 + СТАБИЛИЗАЦИЯ)
 # =====================================================================
 CONFIG = {
     # 1. Фиксация ИП перед стартом (с)
-    "min_hang_sec": 0.55,
+    "min_hang_sec": 0.85,
     # 2. Угол локтей в нижнем висе (градусы)
     "elbow_ext_angle": 166.0,
     # 3. Вис на полусогнутых руках перед стартом, если НЕ БЫЛО чистого виса (с)
@@ -74,6 +75,13 @@ CONFIG = {
     "asym_min_frames": 5,
     # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
     "bar_release_dist": 0.16,
+    # --- ПАРАМЕТРЫ СТАБИЛИЗАЦИИ СКЕЛЕТА (1€ FILTER + ЗАЩИТА ОТ СХЛОПЫВАНИЯ) ---
+    "filter_min_cutoff_x": 0.65,  # Сглаживание по X в покое (убирает боковую дрожь)
+    "filter_beta_x": 0.04,        # Чувствительность к скорости по X
+    "filter_min_cutoff_y": 1.35,  # Сглаживание по Y в покое
+    "filter_beta_y": 0.35,        # Высокая отзывчивость по Y (без задержки в пике тяги)
+    "skeleton_collapse_ratio": 0.68,  # Порог защиты от схлопывания ширины плеч/таза/локтей
+    "max_joint_jump_per_frame": 0.085,  # Максимально допустимый скачок сустава за 1 кадр
 }
 
 
@@ -115,6 +123,305 @@ POSE_CONNECTIONS = [
 ]
 
 
+class StabilizedLandmark:
+    """Легковесный контейнер ключевой точки, совместимый с MediaPipe NormalizedLandmark."""
+    __slots__ = ("x", "y", "z", "visibility", "presence")
+
+    def __init__(self, x, y, z=0.0, visibility=1.0, presence=1.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+        self.visibility = float(visibility)
+        self.presence = float(presence)
+
+
+class OneEuroFilter:
+    """Адаптивный фильтр низких частот 1€ (One Euro Filter) для устранения дрожания без задержки."""
+
+    def __init__(self, min_cutoff=1.0, beta=0.05, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.x_prev = None
+        self.dx_prev = 0.0
+        self.t_prev = None
+
+    @staticmethod
+    def _alpha(t_e, cutoff):
+        r = 2.0 * math.pi * cutoff * t_e
+        return r / (r + 1.0)
+
+    def filter(self, x, t, min_cutoff_override=None, beta_override=None):
+        x = float(x)
+        if self.x_prev is None or self.t_prev is None:
+            self.x_prev = x
+            self.t_prev = float(t)
+            return x
+
+        t_e = float(t) - self.t_prev
+        if t_e <= 1e-6:
+            return self.x_prev
+
+        min_cutoff = self.min_cutoff if min_cutoff_override is None else float(min_cutoff_override)
+        beta = self.beta if beta_override is None else float(beta_override)
+
+        a_d = self._alpha(t_e, self.d_cutoff)
+        dx = (x - self.x_prev) / t_e
+        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
+
+        cutoff = min_cutoff + beta * abs(dx_hat)
+        a = self._alpha(t_e, cutoff)
+        x_hat = a * x + (1.0 - a) * self.x_prev
+
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = float(t)
+        return x_hat
+
+
+class SkeletonStabilizer:
+    """
+    Комплексный стабилизатор скелета:
+    1. Подавляет одиночные выбросы (скачки) при падении уверенности нейросети (камуфляж, сложный фон).
+    2. Предотвращает «схлопывание» парных точек (плеч, локтей, бедер) к центральной оси тела.
+    3. Стабилизирует («якорит») кисти рук на перекладине.
+    4. Применяет раздельный OneEuroFilter по осям X и Y ко всем точкам.
+    """
+
+    HAND_INDICES = {
+        LM.LEFT_WRIST, LM.RIGHT_WRIST,
+        LM.LEFT_PINKY, LM.RIGHT_PINKY,
+        LM.LEFT_INDEX, LM.RIGHT_INDEX,
+    }
+
+    def __init__(self, config=CONFIG):
+        self.cfg = config
+        self.filters_x = {}
+        self.filters_y = {}
+        self.filters_z = {}
+        self.prev_pts = None
+
+        self.orientation_sign = None
+        self.sh_w_history = deque(maxlen=40)
+        self.hip_w_history = deque(maxlen=40)
+        self.wrist_w_history = deque(maxlen=40)
+
+        self.ref_sh_w = None
+        self.ref_hip_w = None
+        self.ref_wrist_w = None
+        self.elbow_outward_ratio = 0.0
+
+    def _get_filters(self, idx):
+        if idx not in self.filters_x:
+            self.filters_x[idx] = OneEuroFilter(
+                min_cutoff=self.cfg["filter_min_cutoff_x"],
+                beta=self.cfg["filter_beta_x"],
+            )
+            self.filters_y[idx] = OneEuroFilter(
+                min_cutoff=self.cfg["filter_min_cutoff_y"],
+                beta=self.cfg["filter_beta_y"],
+            )
+            self.filters_z[idx] = OneEuroFilter(min_cutoff=0.5, beta=0.02)
+        return self.filters_x[idx], self.filters_y[idx], self.filters_z[idx]
+
+    def _restore_pair_width(self, pts, left_idx, right_idx, min_width, target_width):
+        """Восстанавливает горизонтальный разнос парных суставов при схлопывании к центру."""
+        lx, rx = pts[left_idx].x, pts[right_idx].x
+        curr_dx = lx - rx
+        curr_w = abs(curr_dx)
+
+        # Проверяем, не схлопнулись ли точки и не перепутались ли левая/правая стороны
+        sign_flipped = (
+            self.orientation_sign is not None
+            and curr_w > 0.01
+            and (curr_dx * self.orientation_sign < 0)
+        )
+
+        if curr_w < min_width or sign_flipped:
+            if self.prev_pts is not None:
+                prev_center_x = 0.5 * (self.prev_pts[left_idx].x + self.prev_pts[right_idx].x)
+                raw_center_x = 0.5 * (lx + rx)
+                center_x = 0.65 * prev_center_x + 0.35 * raw_center_x
+            else:
+                center_x = 0.5 * (lx + rx)
+
+            sign = self.orientation_sign if self.orientation_sign is not None else (1.0 if curr_dx >= 0 else -1.0)
+            # Плавно возвращаем ширину к эталонной без резкого скачка
+            restored_w = 0.85 * target_width + 0.15 * max(curr_w, min_width)
+            half_w = 0.5 * restored_w
+            pts[left_idx].x = center_x + sign * half_w
+            pts[right_idx].x = center_x - sign * half_w
+
+            # Если при схлопывании возник резкий ложный скачок по Y, демпфируем его
+            if self.prev_pts is not None:
+                pts[left_idx].y = 0.65 * self.prev_pts[left_idx].y + 0.35 * pts[left_idx].y
+                pts[right_idx].y = 0.65 * self.prev_pts[right_idx].y + 0.35 * pts[right_idx].y
+            return True
+        return False
+
+    def process(self, raw_landmarks, timestamp_sec, bar_y=None):
+        pts = [
+            StabilizedLandmark(
+                lm.x,
+                lm.y,
+                getattr(lm, "z", 0.0),
+                getattr(lm, "visibility", 1.0),
+                getattr(lm, "presence", 1.0),
+            )
+            for lm in raw_landmarks
+        ]
+
+        # 1. Подавление одиночных резких выбросов (спайков) и низкого confidence
+        if self.prev_pts is not None:
+            max_jump = self.cfg["max_joint_jump_per_frame"]
+            for idx, p in enumerate(pts):
+                prev_p = self.prev_pts[idx]
+                conf = min(p.visibility, p.presence)
+                dist = math.hypot(p.x - prev_p.x, p.y - prev_p.y)
+
+                if conf < 0.45:
+                    # При низкой уверенности детектора сильнее опираемся на предыдущее положение
+                    blend = 0.25
+                    p.x = prev_p.x + blend * (p.x - prev_p.x)
+                    p.y = prev_p.y + blend * (p.y - prev_p.y)
+                elif dist > max_jump:
+                    scale = max_jump / dist
+                    p.x = prev_p.x + (p.x - prev_p.x) * scale
+                    p.y = prev_p.y + (p.y - prev_p.y) * scale
+
+        # Проверяем, находятся ли кисти на перекладине
+        wrist_y = 0.5 * (pts[LM.LEFT_WRIST].y + pts[LM.RIGHT_WRIST].y)
+        hands_on_bar = (bar_y is None) or (abs(wrist_y - bar_y) < self.cfg["bar_release_dist"])
+
+        # 2. Обновление эталонных пропорций тела на чистых кадрах (когда нет схлопывания)
+        sh_dx = pts[LM.LEFT_SHOULDER].x - pts[LM.RIGHT_SHOULDER].x
+        sh_w = abs(sh_dx)
+        hip_w = abs(pts[LM.LEFT_HIP].x - pts[LM.RIGHT_HIP].x)
+        wrist_w = abs(pts[LM.LEFT_WRIST].x - pts[LM.RIGHT_WRIST].x)
+
+        is_clean_width = (
+            sh_w > 0.055
+            and (self.ref_sh_w is None or sh_w >= 0.72 * self.ref_sh_w)
+        )
+        if is_clean_width:
+            if self.orientation_sign is None:
+                self.orientation_sign = 1.0 if sh_dx >= 0 else -1.0
+            self.sh_w_history.append(sh_w)
+            self.ref_sh_w = float(np.median(self.sh_w_history))
+
+            if hip_w > 0.035 and (self.ref_hip_w is None or hip_w >= 0.70 * self.ref_hip_w):
+                self.hip_w_history.append(hip_w)
+                self.ref_hip_w = float(np.median(self.hip_w_history))
+
+            if hands_on_bar and wrist_w > 0.055:
+                self.wrist_w_history.append(wrist_w)
+                self.ref_wrist_w = float(np.median(self.wrist_w_history))
+
+        # 3. Анатомическая защита от схлопывания к центральной оси
+        collapse_ratio = self.cfg["skeleton_collapse_ratio"]
+
+        if self.ref_sh_w is not None:
+            # 3.1 Защита ширины хвата (кистей) на перекладине
+            if hands_on_bar and self.ref_wrist_w is not None:
+                self._restore_pair_width(
+                    pts,
+                    LM.LEFT_WRIST,
+                    LM.RIGHT_WRIST,
+                    min_width=self.ref_wrist_w * 0.78,
+                    target_width=self.ref_wrist_w,
+                )
+
+            # 3.2 Защита ширины плеч
+            sh_collapsed = self._restore_pair_width(
+                pts,
+                LM.LEFT_SHOULDER,
+                LM.RIGHT_SHOULDER,
+                min_width=self.ref_sh_w * collapse_ratio,
+                target_width=self.ref_sh_w,
+            )
+
+            # 3.3 Защита ширины таза (бедер)
+            target_hip_w = self.ref_hip_w if self.ref_hip_w is not None else (self.ref_sh_w * 0.62)
+            hip_collapsed = self._restore_pair_width(
+                pts,
+                LM.LEFT_HIP,
+                LM.RIGHT_HIP,
+                min_width=target_hip_w * collapse_ratio,
+                target_width=target_hip_w,
+            )
+
+            # 3.4 Защита локтей от схлопывания внутрь туловища (характерно для виса в камуфляже)
+            el_dx = pts[LM.LEFT_ELBOW].x - pts[LM.RIGHT_ELBOW].x
+            el_w = abs(el_dx)
+            expected_arm_span = 0.5 * (
+                abs(pts[LM.LEFT_SHOULDER].x - pts[LM.RIGHT_SHOULDER].x)
+                + abs(pts[LM.LEFT_WRIST].x - pts[LM.RIGHT_WRIST].x)
+            )
+            min_el_w = max(self.ref_sh_w * collapse_ratio, expected_arm_span * 0.66)
+
+            el_sign_flipped = (
+                self.orientation_sign is not None
+                and el_w > 0.01
+                and (el_dx * self.orientation_sign < 0)
+            )
+
+            if el_w < min_el_w or el_sign_flipped:
+                # Реконструируем X локтей по линии «плечо — запястье» с учетом естественного разворота локтей
+                sign = self.orientation_sign if self.orientation_sign is not None else 1.0
+                outward = self.elbow_outward_ratio * self.ref_sh_w
+                pts[LM.LEFT_ELBOW].x = (
+                    0.55 * pts[LM.LEFT_SHOULDER].x
+                    + 0.45 * pts[LM.LEFT_WRIST].x
+                    + sign * outward
+                )
+                pts[LM.RIGHT_ELBOW].x = (
+                    0.55 * pts[LM.RIGHT_SHOULDER].x
+                    + 0.45 * pts[LM.RIGHT_WRIST].x
+                    - sign * outward
+                )
+                if self.prev_pts is not None:
+                    pts[LM.LEFT_ELBOW].y = 0.65 * self.prev_pts[LM.LEFT_ELBOW].y + 0.35 * pts[LM.LEFT_ELBOW].y
+                    pts[LM.RIGHT_ELBOW].y = 0.65 * self.prev_pts[LM.RIGHT_ELBOW].y + 0.35 * pts[LM.RIGHT_ELBOW].y
+            else:
+                # Запоминаем нормальный вынос локтей относительно линии «плечо — кисть»
+                mid_span = max(0.05, expected_arm_span)
+                self.elbow_outward_ratio = float(
+                    np.clip((el_w - mid_span) / (2.0 * self.ref_sh_w), -0.05, 0.25)
+                )
+
+            # 3.5 Если в этом кадре схлопнулся таз или плечи, не даем коленям ложно слипнуться в 0
+            if (sh_collapsed or hip_collapsed) and self.prev_pts is not None:
+                kn_w = abs(pts[LM.LEFT_KNEE].x - pts[LM.RIGHT_KNEE].x)
+                prev_kn_w = abs(self.prev_pts[LM.LEFT_KNEE].x - self.prev_pts[LM.RIGHT_KNEE].x)
+                if kn_w < 0.60 * prev_kn_w:
+                    self._restore_pair_width(
+                        pts,
+                        LM.LEFT_KNEE,
+                        LM.RIGHT_KNEE,
+                        min_width=0.65 * prev_kn_w,
+                        target_width=prev_kn_w,
+                    )
+
+        # 4. Фильтрация каждой точки через OneEuroFilter
+        smoothed_pts = []
+        for idx, p in enumerate(pts):
+            fx, fy, fz = self._get_filters(idx)
+
+            if hands_on_bar and idx in self.HAND_INDICES:
+                # «Якорение» кистей на перекладине: максимальная стабильность хвата
+                sx = fx.filter(p.x, timestamp_sec, min_cutoff_override=0.18, beta_override=0.008)
+                sy = fy.filter(p.y, timestamp_sec, min_cutoff_override=0.25, beta_override=0.015)
+            else:
+                sx = fx.filter(p.x, timestamp_sec)
+                sy = fy.filter(p.y, timestamp_sec)
+
+            sz = fz.filter(p.z, timestamp_sec)
+            smoothed_pts.append(StabilizedLandmark(sx, sy, sz, p.visibility, p.presence))
+
+        self.prev_pts = smoothed_pts
+        return smoothed_pts
+
+
 def ensure_model_path():
     model_path = os.path.join(tempfile.gettempdir(), "pose_landmarker_full.task")
     if not os.path.exists(model_path):
@@ -149,7 +456,7 @@ def draw_skeleton(frame, landmarks, chin_pt=None):
     for idx_a, idx_b in POSE_CONNECTIONS:
         pt1 = (int(landmarks[idx_a].x * w), int(landmarks[idx_a].y * h))
         pt2 = (int(landmarks[idx_b].x * w), int(landmarks[idx_b].y * h))
-        cv2.line(frame, pt1, pt2, (255, 200, 0), 3)
+        cv2.line(frame, pt1, pt2, (255, 200, 0), 3, cv2.LINE_AA)
 
     for idx in [
         LM.NOSE, LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER,
@@ -158,13 +465,13 @@ def draw_skeleton(frame, landmarks, chin_pt=None):
         LM.LEFT_ANKLE, LM.RIGHT_ANKLE
     ]:
         cx, cy = int(landmarks[idx].x * w), int(landmarks[idx].y * h)
-        cv2.circle(frame, (cx, cy), 6, (0, 0, 255), -1)
-        cv2.circle(frame, (cx, cy), 6, (255, 255, 255), 1)
+        cv2.circle(frame, (cx, cy), 6, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 6, (255, 255, 255), 1, cv2.LINE_AA)
 
     if chin_pt is not None:
         ch_x, ch_y = int(chin_pt[0] * w), int(chin_pt[1] * h)
-        cv2.circle(frame, (ch_x, ch_y), 7, (255, 0, 255), -1)
-        cv2.putText(frame, "CHIN", (ch_x + 10, ch_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+        cv2.circle(frame, (ch_x, ch_y), 7, (255, 0, 255), -1, cv2.LINE_AA)
+        cv2.putText(frame, "CHIN", (ch_x + 10, ch_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2, cv2.LINE_AA)
 
 
 def draw_hud(frame, valid_reps, total_attempts, state, hang_sec, elbow_deg, knee_deg, bar_y, chin_above_now, active_errors):
@@ -306,6 +613,17 @@ def analyze_video_pose(
         base_el_tilt = 0.03
         base_el_diff = 5.0
 
+        # Инициализация стабилизатора скелета (1€ Filter + защита от схлопывания)
+        stabilizer = SkeletonStabilizer(CONFIG)
+        chin_x_filter = OneEuroFilter(
+            min_cutoff=CONFIG["filter_min_cutoff_x"],
+            beta=CONFIG["filter_beta_x"]
+        )
+        chin_y_filter = OneEuroFilter(
+            min_cutoff=CONFIG["filter_min_cutoff_y"],
+            beta=CONFIG["filter_beta_y"]
+        )
+
         # Сглаживающие буферы по 3 кадрам
         chin_buf = deque(maxlen=3)
         nose_buf = deque(maxlen=3)
@@ -339,8 +657,8 @@ def analyze_video_pose(
         options = mp.tasks.vision.PoseLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            min_pose_detection_confidence=0.65,
-            min_pose_presence_confidence=0.65,
+            min_pose_detection_confidence=0.55,
+            min_pose_presence_confidence=0.55,
             min_tracking_confidence=0.65
         )
 
@@ -370,7 +688,14 @@ def analyze_video_pose(
                 chin_above_now = False
 
                 if results.pose_landmarks:
-                    lm = results.pose_landmarks[0]
+                    raw_lm = results.pose_landmarks[0]
+
+                    if manual_bar_y is None and len(bar_y_samples) < 60:
+                        bar_y_samples.append(compute_bar_y_from_hands(raw_lm))
+                        bar_y = float(np.median(bar_y_samples))
+
+                    # Стабилизируем скелет перед расчетом углов и отрисовкой
+                    lm = stabilizer.process(raw_lm, current_time, bar_y=bar_y)
 
                     def pt(idx):
                         return [lm[idx].x, lm[idx].y]
@@ -384,16 +709,16 @@ def analyze_video_pose(
 
                     nose = pt(LM.NOSE)
                     m_l, m_r = pt(LM.MOUTH_LEFT), pt(LM.MOUTH_RIGHT)
-                    mouth_x = (m_l[0] + m_r[0]) / 2.0
+                    raw_mouth_x = (m_l[0] + m_r[0]) / 2.0
                     mouth_y = (m_l[1] + m_r[1]) / 2.0
                     raw_chin_y = mouth_y + 0.30 * abs(mouth_y - nose[1])
+
+                    mouth_x = chin_x_filter.filter(raw_mouth_x, current_time)
+                    filtered_chin_y = chin_y_filter.filter(raw_chin_y, current_time)
                     raw_shoulder_y = (l_sh[1] + r_sh[1]) / 2.0
 
                     wrist_y = (l_wr[1] + r_wr[1]) / 2.0
                     wrist_x = (l_wr[0] + r_wr[0]) / 2.0
-                    if manual_bar_y is None and len(bar_y_samples) < 60:
-                        bar_y_samples.append(compute_bar_y_from_hands(lm))
-                        bar_y = float(np.median(bar_y_samples))
 
                     angle_el_l = calculate_angle(l_sh, l_el, l_wr)
                     angle_el_r = calculate_angle(r_sh, r_el, r_wr)
@@ -411,7 +736,7 @@ def analyze_video_pose(
                     else:
                         raw_knee = angle_kn_2d
 
-                    chin_buf.append(raw_chin_y)
+                    chin_buf.append(filtered_chin_y)
                     nose_buf.append(nose[1])
                     elbow_buf.append(raw_elbow)
                     knee_buf.append(raw_knee)
