@@ -18,9 +18,9 @@ MODEL_URL = (
 # =====================================================================
 CONFIG = {
     # 1. Фиксация ИП перед стартом (с)
-    "min_hang_sec": 0.55,
+    "min_hang_sec": 0.85,
     # 2. Угол локтей в нижнем висе (градусы)
-    "elbow_ext_angle": 160.0,
+    "elbow_ext_angle": 168.0,
     # 3. Вис на полусогнутых руках перед стартом (с)
     "pre_bend_max_time": 0.55,
     # 4. Порог начала движения / старт тяги (градусы)
@@ -38,14 +38,16 @@ CONFIG = {
     # 10. Число подтвержденных кадров пика
     "min_chin_above_frames": 1,
     # 11. Порог прямоты ног / 2D-угол в коленях (градусы)
-    "knee_bent_threshold": 130.0,
+    "knee_bent_threshold": 140.0,
     # 12. Порог захлеста голеней назад 3D (доля длины бедра)
     "shin_ratio_threshold": 0.66,
     # 13. Длительность ошибки согнутых коленей (25% кадров, мин. 5 кадров)
     "knee_err_frame_ratio": 0.25,
     "knee_err_min_frames": 5,
-    # 14. Порог скрещивания ног / X-перехлест
-    "cross_product_threshold": -0.00001,
+    # 14. Порог скрещивания ног: минимальный перехлест лодыжек друг за друга (22% ширины таза),
+    # чтобы плотно сомкнутые по правилам ступни НЕ вызывали ложную ошибку
+    "cross_product_threshold": -0.0005,
+    "cross_min_overlap_ratio": 0.22,
     # 15. Длительность ошибки скрещивания (мин. 5 кадров)
     "cross_err_min_frames": 5,
     # 16. Разведение ног / ступни не вместе (125% ширины плеч)
@@ -58,18 +60,18 @@ CONFIG = {
     # 19. Горизонтальный вынос таза (72% ширины плеч)
     "hip_swing_ratio": 0.72,
     # 20. Вынос стоп от таза / мах ногами (70% ширины плеч)
-    "ankle_swing_ratio": 0.60,
+    "ankle_swing_ratio": 0.70,
     # 21. Длительность ошибки маха/рывка (30% кадров, мин. 6 кадров)
-    "kipping_frame_ratio": 0.40,
+    "kipping_frame_ratio": 0.30,
     "kipping_min_frames": 6,
     # 22. Асимметрия: чистая разница углов в локтях сверх калибровки (градусы)
-    "asym_elbow_diff_deg": 30.0,
+    "asym_elbow_diff_deg": 22.0,
     # 23. Асимметрия: перекос линии локтей (20% ширины плеч)
-    "asym_elbow_tilt_ratio": 0.30,
+    "asym_elbow_tilt_ratio": 0.20,
     # 24. Асимметрия: перекос линии плеч (20% ширины плеч)
-    "asym_shoulder_tilt_ratio": 0.30,
+    "asym_shoulder_tilt_ratio": 0.20,
     # 25. Длительность поочередного сгибания рук (20% кадров, мин. 5 кадров)
-    "asym_frame_ratio": 0.30,
+    "asym_frame_ratio": 0.20,
     "asym_min_frames": 5,
     # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
     "bar_release_dist": 0.16,
@@ -474,25 +476,31 @@ def analyze_video_pose(
                         )
                     )
 
-                    # П. 11, 12, 14, 16: положение ног и стоп
+                    # П. 11, 12, 14, 16: положение ног и стоп (исправлена защита для плотно сомкнутых ступней!)
                     ankle_dx = l_an[0] - r_an[0]
                     knee_dx = l_kn[0] - r_kn[0]
                     hip_dx = l_hip[0] - r_hip[0]
-                    hip_w = max(0.035, abs(hip_dx))
+                    hip_w = max(0.04, abs(hip_dx))
                     ankle_dist = abs(ankle_dx)
                     knee_dist = abs(knee_dx)
                     ankle_dy = abs(l_an[1] - r_an[1])
 
+                    # Реальное Х-образное скрещивание: знак ankle_dx инвертирован относительно таза/коленей
+                    # И лодыжки физически зашли друг за друга минимум на 22% ширины таза (исключает шум при сомкнутых стопах)
                     shins_crossed_x = (
-                        (ankle_dx * knee_dx < CONFIG["cross_product_threshold"])
-                        or (ankle_dx * hip_dx < CONFIG["cross_product_threshold"])
+                        (
+                            ankle_dx * hip_dx < CONFIG["cross_product_threshold"]
+                            or ankle_dx * knee_dx < CONFIG["cross_product_threshold"]
+                        )
+                        and (ankle_dist > hip_w * CONFIG["cross_min_overlap_ratio"])
                     )
-                    ankles_overlapped = (
-                        knee_dist > hip_w * 0.45
-                        and ankle_dist < knee_dist * 0.45
-                        and ankle_dy > 0.006
+                    # Наложение стопы поверх другой стопы с явным перепадом по высоте (> 35% ширины таза)
+                    ankles_stacked_vertically = (
+                        knee_dist > hip_w * 0.70
+                        and ankle_dist < hip_w * 0.25
+                        and ankle_dy > hip_w * 0.35
                     )
-                    legs_crossed = shins_crossed_x or ankles_overlapped
+                    legs_crossed = shins_crossed_x or ankles_stacked_vertically
 
                     feet_apart = ankle_dist > (base_shoulder_w * CONFIG["feet_apart_ratio"])
                     knees_bent = (
@@ -507,7 +515,7 @@ def analyze_video_pose(
                         abs(hip_center_x - wrist_x) > (base_shoulder_w * CONFIG["hip_swing_ratio"])
                         or abs(ankle_center_x - hip_center_x) > (base_shoulder_w * CONFIG["ankle_swing_ratio"])
                     )
-                    body_foreshortened = (not knees_bent) and (curr_body_len < base_body_len * 0.89)
+                    body_foreshortened = (not knees_bent) and (curr_body_len < base_body_len * 0.87)
                     kipping_detected = (
                         (mean_hip_angle < CONFIG["hip_kipping_angle"])
                         or horizontal_swing
@@ -517,7 +525,7 @@ def analyze_video_pose(
                     # П. 26: проверка нахождения кистей на перекладине
                     hands_on_bar = abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
 
-                    # П. 7, 8, 9: проверка взятия верхней точки
+                    # П. 7, 8, 9: строгая проверка взятия верхней точки (зеленая линия)
                     chin_above_now = (
                         (chin_y <= bar_y + CONFIG["chin_bar_tolerance"])
                         and (nose_y <= bar_y + CONFIG["nose_bar_margin"])
@@ -674,7 +682,7 @@ def analyze_video_pose(
                                     ):
                                         rep_errors.add("подтягивание рывками или с махом ногами/туловищем")
 
-                                    # П. 10: число подтвержденных кадров пика
+                                    # П. 10: жесткая проверка взятия верхней точки (исправляет попытки № 5, 6, 8)
                                     if chin_above_frames < CONFIG["min_chin_above_frames"]:
                                         rep_errors.add("подбородок ниже уровня грифа перекладины")
 
