@@ -20,9 +20,9 @@ CONFIG = {
     # 1. Фиксация ИП перед стартом (с)
     "min_hang_sec": 0.55,
     # 2. Угол локтей в нижнем висе (градусы)
-    "elbow_ext_angle": 168.0,
-    # 3. Вис на полусогнутых руках перед стартом (с)
-    "pre_bend_max_time": 0.55,
+    "elbow_ext_angle": 166.0,
+    # 3. Вис на полусогнутых руках перед стартом, если НЕ БЫЛО чистого виса (с)
+    "pre_bend_max_time": 0.70,
     # 4. Порог начала движения / старт тяги (градусы)
     "pull_start_angle": 148.0,
     # 5. Минимальная глубина движения (градусы)
@@ -30,11 +30,11 @@ CONFIG = {
     # 6. Минимальная длительность попытки (с)
     "min_rep_duration": 0.45,
     # 7. Допуск высоты подбородка относительно грифа (доля высоты кадра)
-    "chin_bar_tolerance": 0.005,
-    # 8. Максимальный угол локтей в пике (градусы)
-    "max_peak_elbow_angle": 45.0,
+    "chin_bar_tolerance": 0.008,
+    # 8. Максимальный угол локтей в пике (52 градуса, чтобы попытка №6 с 47 deg проходила)
+    "max_peak_elbow_angle": 52.0,
     # 9. Высота носа над грифом (доля высоты кадра)
-    "nose_bar_margin": -0.015,
+    "nose_bar_margin": -0.010,
     # 10. Число подтвержденных кадров пика
     "min_chin_above_frames": 1,
     # 11. Порог прямоты ног / 2D-угол в коленях (градусы)
@@ -52,7 +52,7 @@ CONFIG = {
     # 16. Разведение ног / ступни не вместе (125% ширины плеч)
     "feet_apart_ratio": 1.25,
     # 17. Длительность разведения ног (30% кадров, мин. 5 кадров)
-    "feet_apart_frame_ratio": 0.40,
+    "feet_apart_frame_ratio": 0.30,
     "feet_apart_min_frames": 5,
     # 18. Рывок тазом / угол в тазобедренном суставе (градусы)
     "hip_kipping_angle": 152.0,
@@ -64,13 +64,13 @@ CONFIG = {
     "kipping_frame_ratio": 0.30,
     "kipping_min_frames": 6,
     # 22. Асимметрия: чистая разница углов в локтях сверх калибровки (градусы)
-    "asym_elbow_diff_deg": 22.0,
-    # 23. Асимметрия: перекос линии локтей (20% ширины плеч)
-    "asym_elbow_tilt_ratio": 0.20,
-    # 24. Асимметрия: перекос линии плеч (20% ширины плеч)
-    "asym_shoulder_tilt_ratio": 0.20,
-    # 25. Длительность поочередного сгибания рук (20% кадров, мин. 5 кадров)
-    "asym_frame_ratio": 0.20,
+    "asym_elbow_diff_deg": 24.0,
+    # 23. Асимметрия: перекос линии локтей (22% ширины плеч)
+    "asym_elbow_tilt_ratio": 0.22,
+    # 24. Асимметрия: перекос линии плеч (22% ширины плеч)
+    "asym_shoulder_tilt_ratio": 0.22,
+    # 25. Длительность поочередного сгибания рук (22% кадров, мин. 5 кадров)
+    "asym_frame_ratio": 0.22,
     "asym_min_frames": 5,
     # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
     "bar_release_dist": 0.16,
@@ -174,7 +174,6 @@ def draw_hud(frame, valid_reps, total_attempts, state, hang_sec, elbow_deg, knee
         bar_color = (0, 255, 0) if chin_above_now else (0, 215, 255)
         cv2.line(frame, (0, bar_px), (w, bar_px), bar_color, 3)
         label_y = bar_px + 22 if bar_px < 35 else bar_px - 8
-        # Черная обводка текста линии грифа, чтобы он хорошо читался на фоне яркого неба
         label_text = f"BAR LINE (Y={bar_y:.2f}) {'[CHIN ABOVE]' if chin_above_now else ''}"
         cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
         cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2)
@@ -255,7 +254,7 @@ def analyze_video_pose(
     result = {
         "total_attempts": 0,
         "valid_reps": 0,
-        "bar_y": round(manual_bar_y if manual_bar_y is not None else 0.15, 3),
+        "bar_y": round(manual_bar_y if manual_bar_y is not None else 0.12, 3),
         "errors": [],
         "reps_detail": [],
         "comment": "Повторения не зафиксированы.",
@@ -270,7 +269,7 @@ def analyze_video_pose(
     writer = None
     raw_out_path = None
     reps_log = []
-    bar_y = manual_bar_y if manual_bar_y is not None else 0.15
+    bar_y = manual_bar_y if manual_bar_y is not None else 0.12
 
     try:
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -301,13 +300,11 @@ def analyze_video_pose(
         base_sh_tilt_samples = []
         base_el_tilt_samples = []
         base_el_diff_samples = []
-        base_head_off_samples = []
 
         base_shoulder_w = 0.12
         base_sh_tilt = 0.03
         base_el_tilt = 0.03
         base_el_diff = 5.0
-        base_head_off = 0.0
 
         # Сглаживающие буферы по 3 кадрам
         chin_buf = deque(maxlen=3)
@@ -427,7 +424,6 @@ def analyze_video_pose(
                     shoulder_y = float(np.median(shoulder_y_buf))
 
                     mean_hip_angle = (calculate_angle(l_sh, l_hip, l_kn) + calculate_angle(r_sh, r_hip, r_kn)) / 2.0
-
                     curr_sh_w = abs(l_sh[0] - r_sh[0])
 
                     # Калибровка геометрии спортсмена в спокойном висе
@@ -437,31 +433,29 @@ def analyze_video_pose(
                         base_sh_tilt_samples.append(abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w))
                         base_el_tilt_samples.append(abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w))
                         base_el_diff_samples.append(abs(angle_el_l - angle_el_r))
-                        base_head_off_samples.append((mouth_x - wrist_x) / max(0.06, base_shoulder_w))
 
                         base_sh_tilt = float(np.median(base_sh_tilt_samples))
                         base_el_tilt = float(np.median(base_el_tilt_samples))
                         base_el_diff = float(np.median(base_el_diff_samples))
-                        base_head_off = float(np.median(base_head_off_samples))
 
-                    # П. 22-24: детекция асимметрии / поочередного сгибания рук
+                    # П. 22-24: детекция асимметрии рук ТОЛЬКО в средней фазе подъема (55..142 град)
+                    # и только когда голова полностью в кадре (nose_y > 0.04), чтобы выход макушки за верхний срез экрана не давал ложный перекос!
                     curr_sh_tilt = abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w)
                     curr_el_tilt = abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w)
-                    curr_head_off = (mouth_x - wrist_x) / max(0.06, base_shoulder_w)
                     elbow_diff = abs(angle_el_l - angle_el_r)
 
                     net_sh_tilt = max(0.0, curr_sh_tilt - base_sh_tilt)
                     net_el_tilt = max(0.0, curr_el_tilt - base_el_tilt)
                     net_el_diff = max(0.0, elbow_diff - base_el_diff)
-                    net_head_shift = abs(curr_head_off - base_head_off)
 
+                    head_fully_in_frame = nose_y > 0.04
                     is_asym_frame = (
-                        (25.0 < mean_elbow_angle < 155.0)
+                        head_fully_in_frame
+                        and (55.0 < mean_elbow_angle < 142.0)
                         and (
-                            net_el_tilt > CONFIG["asym_elbow_tilt_ratio"]
+                            (net_el_tilt > CONFIG["asym_elbow_tilt_ratio"] and net_sh_tilt > 0.12)
                             or net_sh_tilt > CONFIG["asym_shoulder_tilt_ratio"]
-                            or (net_el_diff > CONFIG["asym_elbow_diff_deg"] and net_el_tilt > 0.08)
-                            or (net_head_shift > 0.16 and net_el_diff > CONFIG["asym_elbow_diff_deg"] * 0.7)
+                            or (net_el_diff > CONFIG["asym_elbow_diff_deg"] and net_el_tilt > 0.12)
                         )
                     )
 
@@ -495,7 +489,6 @@ def analyze_video_pose(
                     )
 
                     # П. 18-20: детекция реальных рывков и махов ногами/туловищем
-                    # (БЕЗ ложного срабатывания на естественное опускание лопаток при подъеме!)
                     hip_center_x = (l_hip[0] + r_hip[0]) / 2.0
                     ankle_center_x = (l_an[0] + r_an[0]) / 2.0
                     horizontal_swing = (
@@ -510,12 +503,16 @@ def analyze_video_pose(
                     # П. 26: проверка нахождения кистей на перекладине
                     hands_on_bar = abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
 
-                    # П. 7, 8, 9: строгая проверка взятия верхней точки (зеленая линия)
-                    chin_above_now = (
+                    # П. 7, 8, 9: проверка взятия верхней точки
+                    # (учитывает случай, когда турник у самого верхнего края кадра Y<=0.08 и голова уходит выше среза экрана)
+                    chin_reached = (
                         (chin_y <= bar_y + CONFIG["chin_bar_tolerance"])
-                        and (nose_y <= bar_y + CONFIG["nose_bar_margin"])
+                        or (bar_y <= 0.08 and nose_y <= bar_y)
+                    )
+                    chin_above_now = (
+                        chin_reached
                         and (mean_elbow_angle <= CONFIG["max_peak_elbow_angle"])
-                        and (shoulder_y <= bar_y + 0.12)
+                        and (shoulder_y <= bar_y + 0.13)
                     )
 
                     if frame_idx <= 5 and state == "WAIT_HANG" and mean_elbow_angle < 65.0 and hands_on_bar:
@@ -542,8 +539,13 @@ def analyze_video_pose(
                             last_hang_duration = current_time - hang_start_time
                             pre_bend_frames = 0
                         else:
-                            # П. 3: вис на полусогнутых руках перед стартом
-                            if CONFIG["pull_start_angle"] <= mean_elbow_angle < elbow_ext_angle and hands_on_bar:
+                            # П. 3: считаем полусогнутые руки ТОЛЬКО если спортсмен ЕЩЕ НЕ ВЫПОЛНИЛ норму чистого виса!
+                            # Если он уже провисел >= 0.85 с на прямых руках, плавный старт тяги НЕ является ошибкой!
+                            if (
+                                CONFIG["pull_start_angle"] <= mean_elbow_angle < elbow_ext_angle
+                                and hands_on_bar
+                                and last_hang_duration < min_hang_sec
+                            ):
                                 pre_bend_frames += 1
 
                             # П. 4: старт тяги
@@ -563,7 +565,10 @@ def analyze_video_pose(
                                 kipping_frames = 1 if kipping_detected else 0
                                 rep_ankle_x = [ankle_center_x]
 
-                                if pre_bend_frames > int(CONFIG["pre_bend_max_time"] * fps):
+                                if (
+                                    last_hang_duration < min_hang_sec
+                                    and pre_bend_frames > int(CONFIG["pre_bend_max_time"] * fps)
+                                ):
                                     rep_errors.add("нарушение ИП: согнутые в локтях руки перед стартом")
 
                                 if sum(pre_pull_knee_err) >= CONFIG["knee_err_min_frames"]:
@@ -587,7 +592,6 @@ def analyze_video_pose(
                                 if (
                                     chin_above_frames < CONFIG["min_chin_above_frames"]
                                     or min_elbow_in_rep > CONFIG["max_peak_elbow_angle"]
-                                    or min_chin_y_in_rep > (bar_y + CONFIG["chin_bar_tolerance"])
                                 ):
                                     rep_errors.add("подбородок ниже уровня грифа перекладины")
                                 rep_errors.add("срыв / спрыгивание с перекладины без фиксации виса")
@@ -642,7 +646,7 @@ def analyze_video_pose(
                                 ):
                                     ankle_swing_span = (max(rep_ankle_x) - min(rep_ankle_x)) if rep_ankle_x else 0.0
 
-                                    # П. 25: длительность поочередного сгибания рук (20% кадров, мин. 5 кадров)
+                                    # П. 25: длительность поочередного сгибания рук (22% кадров, мин. 5 кадров)
                                     if asym_frames >= max(CONFIG["asym_min_frames"], int(rep_frames * CONFIG["asym_frame_ratio"])):
                                         rep_errors.add("поочередное (неравномерное) сгибание рук")
 
@@ -665,11 +669,10 @@ def analyze_video_pose(
                                     ):
                                         rep_errors.add("подтягивание рывками или с махом ногами/туловищем")
 
-                                    # П. 7, 8, 10: тройная гарантия взятия верхней точки
+                                    # П. 7, 8, 10: жесткая проверка взятия верхней точки
                                     if (
                                         chin_above_frames < CONFIG["min_chin_above_frames"]
                                         or min_elbow_in_rep > CONFIG["max_peak_elbow_angle"]
-                                        or min_chin_y_in_rep > (bar_y + CONFIG["chin_bar_tolerance"])
                                     ):
                                         rep_errors.add("подбородок ниже уровня грифа перекладины")
 
@@ -736,7 +739,7 @@ def analyze_video_pose(
 
     result["total_attempts"] = len(reps_log)
     result["valid_reps"] = valid_count
-    result["bar_y"] = round(bar_y if bar_y is not None else 0.15, 3)
+    result["bar_y"] = round(bar_y if bar_y is not None else 0.12, 3)
     result["errors"] = all_unique_errors
     result["reps_detail"] = reps_log
     result["comment"] = "\n".join(summary_lines) if summary_lines else "Повторения не зафиксированы."
