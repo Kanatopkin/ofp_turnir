@@ -31,53 +31,53 @@ CONFIG = {
     # 6. Минимальная длительность попытки (с)
     "min_rep_duration": 0.45,
     # 7. Допуск высоты подбородка относительно грифа (доля высоты кадра)
-    "chin_bar_tolerance": 0.005,
+    "chin_bar_tolerance": 0.006,
     # 8. Максимальный угол локтей в пике (градусы)
-    "max_peak_elbow_angle": 52.0,
-    # 9. Минимальный запас высоты носа над грифом в пике (доля высоты кадра)
-    "nose_bar_margin": -0.018,
-    # 9а. Максимально допустимое расстояние от грифа до линии плеч в пике (отсекает недотяги)
-    "max_peak_shoulder_drop": 0.075,
+    "max_peak_elbow_angle": 48.0,
+    # 9. Высота носа над грифом (доля высоты кадра)
+    "nose_bar_margin": -0.010,
+    # 9а. Максимально допустимое расстояние от грифа до линии плеч в пике (отсекает недотяг на 00:38)
+    "max_peak_shoulder_drop": 0.052,
     # 10. Число подтвержденных кадров пика
-    "min_chin_above_frames": 2,
+    "min_chin_above_frames": 1,
     # 11. Порог прямоты ног / 2D-угол в коленях (градусы)
     "knee_bent_threshold": 145.0,
     # 12. Порог захлеста голеней назад 3D (доля длины бедра)
-    "shin_ratio_threshold": 0.68,
+    "shin_ratio_threshold": 0.66,
     # 13. Длительность ошибки согнутых коленей (20% кадров, мин. 4 кадра)
     "knee_err_frame_ratio": 0.20,
     "knee_err_min_frames": 4,
     # 14. Порог скрещивания ног (исключает шум при сомкнутых ступнях)
-    "cross_product_threshold": -0.0004,
-    "cross_min_overlap_ratio": 0.20,
-    # 15. Длительность ошибки скрещивания (мин. 4 кадра)
-    "cross_err_min_frames": 4,
+    "cross_product_threshold": -0.0002,
+    "cross_min_overlap_ratio": 0.14,
+    # 15. Длительность ошибки скрещивания (мин. 3 кадра)
+    "cross_err_min_frames": 3,
     # 16. Разведение ног / ступни не вместе (120% ширины плеч)
     "feet_apart_ratio": 1.20,
     # 17. Длительность разведения ног (25% кадров, мин. 5 кадров)
     "feet_apart_frame_ratio": 0.25,
     "feet_apart_min_frames": 5,
     # 18. Рывок тазом / угол в тазобедренном суставе (градусы)
-    "hip_kipping_angle": 155.0,
-    # 19. Горизонтальный вынос таза (45% ширины плеч)
-    "hip_swing_ratio": 0.45,
-    # 20. Вынос стоп от таза / мах ногами (45% ширины плеч)
-    "ankle_swing_ratio": 0.45,
-    # 20а. Маятниковое отклонение стоп от оси плеч/кистей (42% ширины плеч)
-    "body_pendulum_swing_ratio": 0.42,
-    # 20б. Размах горизонтального раскачивания стоп за попытку (42% ширины плеч)
-    "ankle_swing_span_ratio": 0.42,
-    # 21. Длительность ошибки маха/рывка (20% кадров, мин. 4 кадра)
-    "kipping_frame_ratio": 0.20,
-    "kipping_min_frames": 4,
+    "hip_kipping_angle": 151.0,
+    # 18а. Изгиб центральной оси тела (плечи - таз - колени) при махе (градусы)
+    "center_body_bend_angle": 165.0,
+    # 19. Горизонтальный вынос таза от оси плеч (60% ширины плеч)
+    "hip_swing_ratio": 0.60,
+    # 20. Вынос стоп от таза / боковой мах ногами (52% ширины плеч)
+    "ankle_swing_ratio": 0.52,
+    # 20а. Размах горизонтального раскачивания стоп за попытку (58% ширины плеч)
+    "ankle_swing_span_ratio": 0.58,
+    # 21. Длительность ошибки маха/рывка (25% кадров, мин. 5 кадров)
+    "kipping_frame_ratio": 0.25,
+    "kipping_min_frames": 5,
     # 22. Асимметрия: чистая разница углов в локтях сверх калибровки (градусы)
     "asym_elbow_diff_deg": 18.0,
     # 23. Асимметрия: перекос линии локтей (14% ширины плеч)
     "asym_elbow_tilt_ratio": 0.14,
     # 24. Асимметрия: перекос линии плеч (14% ширины плеч)
     "asym_shoulder_tilt_ratio": 0.14,
-    # 25. Длительность поочередного сгибания рук (15% кадров, мин. 4 кадра)
-    "asym_frame_ratio": 0.15,
+    # 25. Длительность поочередного сгибания рук (16% кадров, мин. 4 кадра)
+    "asym_frame_ratio": 0.16,
     "asym_min_frames": 4,
     # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
     "bar_release_dist": 0.16,
@@ -435,17 +435,19 @@ def compute_bar_y_from_hands(lm):
 
 def compute_anatomical_chin(lm, base_shoulder_w=0.12):
     """
-    Вычисляет координаты подбородка с защитой от инверсии при перекрытии лица грифом перекладины:
-    подбородок анатомически всегда находится строго ниже носа и линии рта.
+    Вычисляет положение подбородка с двойной анатомической защитой:
+    1) Подбородок всегда ниже носа и рта.
+    2) Подбородок не может оторваться вверх от линии плеч больше чем на высоту шеи (0.34 * base_shoulder_w),
+       даже если перекладина перекрывает лицо и точки рта/носа подскакивают на гриф.
     """
     nose_x, nose_y = lm[LM.NOSE].x, lm[LM.NOSE].y
     mouth_x = 0.5 * (lm[LM.MOUTH_LEFT].x + lm[LM.MOUTH_RIGHT].x)
     raw_mouth_y = 0.5 * (lm[LM.MOUTH_LEFT].y + lm[LM.MOUTH_RIGHT].y)
+    shoulder_y = 0.5 * (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y)
 
-    # Если гриф перекрывает лицо и точки рта подскакивают выше носа, принудительно опускаем их ниже носа
     valid_mouth_y = max(raw_mouth_y, nose_y + 0.08 * base_shoulder_w)
     chin_drop = max(0.35 * (valid_mouth_y - nose_y), 0.14 * base_shoulder_w)
-    chin_y = valid_mouth_y + chin_drop
+    chin_y = max(valid_mouth_y + chin_drop, shoulder_y - 0.34 * base_shoulder_w)
     chin_x = 0.70 * mouth_x + 0.30 * nose_x
     return chin_x, chin_y
 
@@ -711,7 +713,6 @@ def analyze_video_pose(
                     shoulder_center_x = (l_sh[0] + r_sh[0]) / 2.0
 
                     wrist_y = (l_wr[1] + r_wr[1]) / 2.0
-                    wrist_x = (l_wr[0] + r_wr[0]) / 2.0
 
                     angle_el_l = calculate_angle(l_sh, l_el, l_wr)
                     angle_el_r = calculate_angle(r_sh, r_el, r_wr)
@@ -736,11 +737,15 @@ def analyze_video_pose(
                     shoulder_y_buf.append(raw_shoulder_y)
 
                     nose_y = float(np.median(nose_buf))
-                    # Гарантируем, что сглаженный подбородок никогда не окажется выше носа
-                    chin_y = max(float(np.median(chin_buf)), nose_y + 0.20 * base_shoulder_w)
+                    shoulder_y = float(np.median(shoulder_y_buf))
+                    # Подбородок не может быть выше носа и не может оторваться от плеч выше предела шеи
+                    chin_y = max(
+                        float(np.median(chin_buf)),
+                        nose_y + 0.18 * base_shoulder_w,
+                        shoulder_y - 0.34 * base_shoulder_w
+                    )
                     mean_elbow_angle = float(np.median(elbow_buf))
                     mean_knee_angle = float(np.median(knee_buf))
-                    shoulder_y = float(np.median(shoulder_y_buf))
 
                     mean_hip_angle = (calculate_angle(l_sh, l_hip, l_kn) + calculate_angle(r_sh, r_hip, r_kn)) / 2.0
                     curr_sh_w = abs(l_sh[0] - r_sh[0])
@@ -757,8 +762,7 @@ def analyze_video_pose(
                         base_el_tilt = float(np.median(base_el_tilt_samples))
                         base_el_diff = float(np.median(base_el_diff_samples))
 
-                    # П. 22-24: детекция асимметрии рук во всем рабочем диапазоне тяги (15..164 град),
-                    # когда голова полностью в кадре (nose_y > 0.04)
+                    # П. 22-24: детекция асимметрии рук
                     curr_sh_tilt = abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w)
                     curr_el_tilt = abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w)
                     elbow_diff = abs(angle_el_l - angle_el_r)
@@ -795,9 +799,9 @@ def analyze_video_pose(
                         and (ankle_dist > hip_w * CONFIG["cross_min_overlap_ratio"])
                     )
                     ankles_stacked_vertically = (
-                        knee_dist > hip_w * 0.60
-                        and ankle_dist < hip_w * 0.28
-                        and ankle_dy > hip_w * 0.28
+                        knee_dist > hip_w * 0.45
+                        and (ankle_dist < knee_dist * 0.45 or ankle_dist < hip_w * 0.28)
+                        and ankle_dy > hip_w * 0.20
                     )
                     legs_crossed = shins_crossed_x or ankles_stacked_vertically
 
@@ -807,30 +811,38 @@ def analyze_video_pose(
                         or (shin_ratio < CONFIG["shin_ratio_threshold"])
                     )
 
-                    # П. 18-20: детекция рывков, махов ногами и маятникового раскачивания корпуса
+                    # П. 18-20: детекция реальных рывков и махов без ложных срабатываний на прямом теле
                     hip_center_x = (l_hip[0] + r_hip[0]) / 2.0
+                    hip_center_y = (l_hip[1] + r_hip[1]) / 2.0
+                    knee_center_x = (l_kn[0] + r_kn[0]) / 2.0
+                    knee_center_y = (l_kn[1] + r_kn[1]) / 2.0
                     ankle_center_x = (l_an[0] + r_an[0]) / 2.0
+
+                    center_body_angle = calculate_angle(
+                        [shoulder_center_x, shoulder_y],
+                        [hip_center_x, hip_center_y],
+                        [knee_center_x, knee_center_y]
+                    )
                     horizontal_swing = (
-                        abs(hip_center_x - wrist_x) > (base_shoulder_w * CONFIG["hip_swing_ratio"])
+                        abs(hip_center_x - shoulder_center_x) > (base_shoulder_w * CONFIG["hip_swing_ratio"])
                         or abs(ankle_center_x - hip_center_x) > (base_shoulder_w * CONFIG["ankle_swing_ratio"])
-                        or abs(ankle_center_x - shoulder_center_x) > (base_shoulder_w * CONFIG["body_pendulum_swing_ratio"])
-                        or abs(ankle_center_x - wrist_x) > (base_shoulder_w * CONFIG["body_pendulum_swing_ratio"])
                     )
                     kipping_detected = (
                         (mean_hip_angle < CONFIG["hip_kipping_angle"])
+                        or (center_body_angle < CONFIG["center_body_bend_angle"])
                         or horizontal_swing
                     )
 
                     # П. 26: проверка нахождения кистей на перекладине
                     hands_on_bar = abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
 
-                    # П. 7, 8, 9: строгая проверка взятия верхней точки (подбородок И нос выше грифа, плечи у грифа)
+                    # П. 7, 8, 9: проверка взятия верхней точки
                     chin_reached = (
                         (
                             chin_y <= bar_y + CONFIG["chin_bar_tolerance"]
                             and nose_y <= bar_y + CONFIG["nose_bar_margin"]
                         )
-                        or (bar_y <= 0.08 and nose_y <= bar_y - 0.01)
+                        or (bar_y <= 0.08 and nose_y <= bar_y)
                     )
                     chin_above_now = (
                         chin_reached
@@ -862,8 +874,7 @@ def analyze_video_pose(
                             last_hang_duration = current_time - hang_start_time
                             pre_bend_frames = 0
                         else:
-                            # П. 3: считаем время нахождения в висе на полусогнутых руках (148..166 град)
-                            # независимо от того, был ли до этого чистый вис (ловит задержку на полусогнутых руках как в попытке №4)
+                            # П. 3: контроль виса на полусогнутых руках перед стартом тяги (попытка №4)
                             if (
                                 CONFIG["pull_start_angle"] <= mean_elbow_angle < elbow_ext_angle
                                 and hands_on_bar
@@ -981,7 +992,7 @@ def analyze_video_pose(
                                     if feet_apart_frames >= max(CONFIG["feet_apart_min_frames"], int(rep_frames * CONFIG["feet_apart_frame_ratio"])):
                                         rep_errors.add("нарушение ИП: ступни не вместе (ноги разведены)")
 
-                                    # П. 21: рывки / махи ногами или маятниковое раскачивание туловища
+                                    # П. 21: рывки / махи ногами или туловищем
                                     if (
                                         kipping_frames >= max(CONFIG["kipping_min_frames"], int(rep_frames * CONFIG["kipping_frame_ratio"]))
                                         or ankle_swing_span > (base_shoulder_w * CONFIG["ankle_swing_span_ratio"])
