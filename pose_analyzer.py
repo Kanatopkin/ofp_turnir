@@ -48,8 +48,8 @@ CONFIG = {
     "knee_err_frame_ratio": 0.18,
     "knee_err_min_frames": 3,
     # 14. Порог скрещивания ног (отлавливает попытку № 8 на 00:43-00:45 и защищает параллельные сомкнутые ноги)
-    "cross_product_threshold": -0.00020,
-    "cross_min_overlap_ratio": 0.1,
+    "cross_product_threshold": -0.00030,
+    "cross_min_overlap_ratio": 0.15,
     # 15. Длительность ошибки скрещивания (мин. 3 кадра)
     "cross_err_min_frames": 6,
     # 16. Разведение ног / ступни не вместе (120% ширины плеч)
