@@ -1,3 +1,33 @@
+import os
+import subprocess
+import sys
+
+# Автоматическая установка ultralytics, если пакет отсутствует в контейнере
+try:
+  import torch
+  from ultralytics import YOLO
+except ModuleNotFoundError:
+  subprocess.check_call([
+      sys.executable,
+      "-m",
+      "pip",
+      "install",
+      "--extra-index-url",
+      "https://download.pytorch.org/whl/cpu",
+      "torch",
+      "torchvision",
+      "ultralytics",
+      "opencv-python-headless",
+  ])
+  import torch
+  from ultralytics import YOLO
+
+# В Streamlit Cloud (на CPU) используем yolov8s-pose.pt для экономии RAM и высокой скорости,
+# а при наличии GPU (CUDA) — yolov8m-pose.pt
+DEFAULT_MODEL = (
+    "yolov8m-pose.pt" if torch.cuda.is_available() else "yolov8s-pose.pt"
+)
+YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", DEFAULT_MODEL)
 from collections import deque
 import math
 import os
