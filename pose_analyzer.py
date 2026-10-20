@@ -1,33 +1,3 @@
-import os
-import subprocess
-import sys
-
-# Автоматическая установка ultralytics, если пакет отсутствует в контейнере
-try:
-  import torch
-  from ultralytics import YOLO
-except ModuleNotFoundError:
-  subprocess.check_call([
-      sys.executable,
-      "-m",
-      "pip",
-      "install",
-      "--extra-index-url",
-      "https://download.pytorch.org/whl/cpu",
-      "torch",
-      "torchvision",
-      "ultralytics",
-      "opencv-python-headless",
-  ])
-  import torch
-  from ultralytics import YOLO
-
-# В Streamlit Cloud (на CPU) используем yolov8s-pose.pt для экономии RAM и высокой скорости,
-# а при наличии GPU (CUDA) — yolov8m-pose.pt
-DEFAULT_MODEL = (
-    "yolov8m-pose.pt" if torch.cuda.is_available() else "yolov8s-pose.pt"
-)
-YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", DEFAULT_MODEL)
 from collections import deque
 import math
 import os
@@ -38,9 +8,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# По умолчанию используется модель среднего размера (оптимальный баланс точности и скорости).
-# Возможные варианты: "yolov8n-pose.pt", "yolov8s-pose.pt", "yolov8m-pose.pt", "yolov8l-pose.pt"
-YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8m-pose.pt")
+# Модель YOLOv8-Pose (по умолчанию yolov8s-pose.pt для CPU / Streamlit Cloud, yolov8m-pose.pt для GPU)
+YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8s-pose.pt")
 _MODEL_INSTANCE = None
 
 # =====================================================================
@@ -170,7 +139,7 @@ class StabilizedLandmark:
 
 
 def get_yolo_model():
-    """Ленивая загрузка модели YOLOv8-Pose (кешируется в памяти процесса)."""
+    """Ленивая загрузка модели YOLOv8-Pose."""
     global _MODEL_INSTANCE
     if _MODEL_INSTANCE is None:
         _MODEL_INSTANCE = YOLO(YOLO_MODEL_NAME)
@@ -178,10 +147,7 @@ def get_yolo_model():
 
 
 def select_target_athlete(yolo_result, prev_center=None):
-    """
-    Выбирает целевого спортсмена на турнике из всех людей в кадре (защита от людей на фоне).
-    Возвращает (список из 17 StabilizedLandmark, новый_центр_масс) или (None, prev_center).
-    """
+    """Выбор целевого спортсмена на турнике из всех обнаруженных людей."""
     if (
         yolo_result is None
         or yolo_result.keypoints is None
@@ -211,17 +177,11 @@ def select_target_athlete(yolo_result, prev_center=None):
         kpts = xyn_all[i]
         confs = conf_all[i]
 
-        # Проверяем, что плечи и бедрадетектированы
-        sh_valid = confs[LM.LEFT_SHOULDER] > 0.25 and confs[LM.RIGHT_SHOULDER] > 0.25
-        if not sh_valid:
+        if confs[LM.LEFT_SHOULDER] < 0.25 or confs[LM.RIGHT_SHOULDER] < 0.25:
             continue
 
-        cx = float(
-            0.5 * (kpts[LM.LEFT_SHOULDER][0] + kpts[LM.RIGHT_SHOULDER][0])
-        )
-        cy = float(
-            0.5 * (kpts[LM.LEFT_SHOULDER][1] + kpts[LM.RIGHT_SHOULDER][1])
-        )
+        cx = float(0.5 * (kpts[LM.LEFT_SHOULDER][0] + kpts[LM.RIGHT_SHOULDER][0]))
+        cy = float(0.5 * (kpts[LM.LEFT_SHOULDER][1] + kpts[LM.RIGHT_SHOULDER][1]))
 
         if boxes_xywhn is not None and i < len(boxes_xywhn):
             _, _, bw, bh = boxes_xywhn[i]
@@ -232,15 +192,11 @@ def select_target_athlete(yolo_result, prev_center=None):
                 * abs(kpts[LM.LEFT_SHOULDER][0] - kpts[LM.RIGHT_SHOULDER][0])
             )
 
-        # Бонус, если запястья подняты выше плеч или на уровне головы (поза виса/тяги)
         wrists_y = 0.5 * (kpts[LM.LEFT_WRIST][1] + kpts[LM.RIGHT_WRIST][1])
         hands_up_bonus = 0.35 if wrists_y < cy + 0.05 else -0.25
-
-        # Близость к центру кадра
         center_dist = math.hypot(cx - 0.5, cy - 0.45)
 
         if prev_center is not None:
-            # Жесткая привязка к уже отслеживаемому спортсмену между кадрами
             track_dist = math.hypot(cx - prev_center[0], cy - prev_center[1])
             if track_dist > 0.28:
                 continue
@@ -271,7 +227,7 @@ def select_target_athlete(yolo_result, prev_center=None):
 
 
 class OneEuroFilter:
-    """Адаптивный фильтр низких частот 1€ (One Euro Filter) для устранения дрожания без задержки."""
+    """Адаптивный фильтр низких частот 1€ (One Euro Filter)."""
 
     def __init__(self, min_cutoff=1.0, beta=0.05, d_cutoff=1.0):
         self.min_cutoff = float(min_cutoff)
@@ -315,7 +271,7 @@ class OneEuroFilter:
 
 
 class SkeletonStabilizer:
-    """Стабилизатор 17-точечного скелета YOLOv8: подавление выбросов, защита от схлопывания и 1€-фильтрация."""
+    """Стабилизатор скелета с защитой от схлопывания."""
 
     HAND_INDICES = {LM.LEFT_WRIST, LM.RIGHT_WRIST}
 
@@ -384,7 +340,6 @@ class SkeletonStabilizer:
             for lm in raw_landmarks
         ]
 
-        # Защита от нулевых координат (если точка не видна в кадре) и резких выбросов
         if self.prev_pts is not None:
             max_jump = self.cfg["max_joint_jump_per_frame"]
             for idx, p in enumerate(pts):
@@ -527,22 +482,12 @@ def format_timestamp(seconds):
 
 
 def compute_bar_y_from_hands(lm):
-    """
-    Вычисляет уровень перекладины (BAR LINE) для 17 точек COCO:
-    так как в COCO нет точек пальцев (INDEX/PINKY), гриф находится чуть выше запястий
-    на величину ~0.18 от ширины плеч.
-    """
     wrist_y = 0.5 * (lm[LM.LEFT_WRIST].y + lm[LM.RIGHT_WRIST].y)
     sh_w = max(0.08, abs(lm[LM.LEFT_SHOULDER].x - lm[LM.RIGHT_SHOULDER].x))
     return float(max(0.02, wrist_y - 0.18 * sh_w))
 
 
 def compute_anatomical_chin(lm, base_shoulder_w=0.12):
-    """
-    Вычисляет положение подбородка (CHIN) по 17 точкам COCO (нос, глаза, уши, плечи):
-    1) Использует расстояние от линии глаз до носа и ширину плеч для точной оценки высоты нижней челюсти.
-    2) Ограничивает подбородок относительно линии плеч, чтобы при перекрытии лица грифом точка CHIN не прыгала вверх.
-    """
     nose_x, nose_y = lm[LM.NOSE].x, lm[LM.NOSE].y
     shoulder_y = 0.5 * (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y)
     shoulder_x = 0.5 * (lm[LM.LEFT_SHOULDER].x + lm[LM.RIGHT_SHOULDER].x)
@@ -766,11 +711,12 @@ def analyze_video_pose(
             if scale < 1.0:
                 frame = cv2.resize(frame, (out_w, out_h))
 
-            preds = model.predict(
-    frame, conf=0.35, imgsz=640, verbose=False, device="cpu"
-    if not torch.cuda.is_available()
-    else 0,
-)
+            preds = model.predict(frame, conf=0.35, verbose=False)
+            raw_lm, tracked_athlete_center = (
+                select_target_athlete(preds[0], tracked_athlete_center)
+                if preds
+                else (None, tracked_athlete_center)
+            )
 
             mean_elbow_angle = 0.0
             mean_knee_angle = 180.0
@@ -807,7 +753,6 @@ def analyze_video_pose(
                 angle_el_r = calculate_angle(r_sh, r_el, r_wr)
                 raw_elbow = (angle_el_l + angle_el_r) / 2.0
 
-                # П. 11-12: угол в коленях и 3D-захлест голеней назад
                 angle_kn_2d = (calculate_angle(l_hip, l_kn, l_an) + calculate_angle(r_hip, r_kn, r_an)) / 2.0
                 thigh_len = (np.hypot(l_kn[0] - l_hip[0], l_kn[1] - l_hip[1]) + np.hypot(r_kn[0] - r_hip[0], r_kn[1] - r_hip[1])) / 2.0
                 shin_len = (np.hypot(l_an[0] - l_kn[0], l_an[1] - l_kn[1]) + np.hypot(r_an[0] - r_kn[0], r_an[1] - r_kn[1])) / 2.0
@@ -838,7 +783,6 @@ def analyze_video_pose(
                 mean_hip_angle = (calculate_angle(l_sh, l_hip, l_kn) + calculate_angle(r_sh, r_hip, r_kn)) / 2.0
                 curr_sh_w = abs(l_sh[0] - r_sh[0])
 
-                # Калибровка геометрии спортсмена в спокойном висе
                 if mean_elbow_angle >= 170.0 and curr_sh_w > 0.05 and len(shoulder_w_samples) < 50:
                     shoulder_w_samples.append(curr_sh_w)
                     base_shoulder_w = float(np.median(shoulder_w_samples))
@@ -850,7 +794,6 @@ def analyze_video_pose(
                     base_el_tilt = float(np.median(base_el_tilt_samples))
                     base_el_diff = float(np.median(base_el_diff_samples))
 
-                # П. 22-24: детекция асимметрии рук
                 curr_sh_tilt = abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w)
                 curr_el_tilt = abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w)
                 elbow_diff = abs(angle_el_l - angle_el_r)
@@ -870,7 +813,6 @@ def analyze_video_pose(
                     )
                 )
 
-                # П. 11, 12, 14, 16: положение ног и стоп
                 ankle_dx = l_an[0] - r_an[0]
                 knee_dx = l_kn[0] - r_kn[0]
                 hip_dx = l_hip[0] - r_hip[0]
@@ -899,7 +841,6 @@ def analyze_video_pose(
                     or (shin_ratio < CONFIG["shin_ratio_threshold"])
                 )
 
-                # П. 18-20: детекция рывков и махов
                 hip_center_x = (l_hip[0] + r_hip[0]) / 2.0
                 hip_center_y = (l_hip[1] + r_hip[1]) / 2.0
                 knee_center_x = (l_kn[0] + r_kn[0]) / 2.0
@@ -921,10 +862,8 @@ def analyze_video_pose(
                     or horizontal_swing
                 )
 
-                # П. 26: проверка нахождения кистей на перекладине
                 hands_on_bar = abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
 
-                # П. 7, 8, 9: проверка взятия верхней точки
                 chin_reached = (
                     (
                         chin_y <= bar_y + CONFIG["chin_bar_tolerance"]
