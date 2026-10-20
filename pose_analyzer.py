@@ -46,8 +46,8 @@ CONFIG = {
     # 12. Порог захлеста голеней назад 3D (доля длины бедра)
     "shin_ratio_threshold": 0.66,
     # 13. Длительность ошибки согнутых коленей (18% кадров, мин. 3 кадра)
-    "knee_err_frame_ratio": 0.25,
-    "knee_err_min_frames": 5,
+    "knee_err_frame_ratio": 0.10,
+    "knee_err_min_frames": 3,
     # 14. Порог скрещивания ног (отлавливает попытку № 8 на 00:43-00:45)
     "cross_product_threshold": 0.00005,
     "cross_min_ankle_hip_ratio": 0.22,
