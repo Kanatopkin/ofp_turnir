@@ -15,7 +15,7 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from pose_analyzer import analyze_video_pose, get_calibration_preview
 
 st.set_page_config(
-    page_title="Турнир по подтягиванию | Pose Estimation",
+    page_title="Турнир по подтягиванию | Командный зачет",
     page_icon="🏆",
     layout="wide"
 )
@@ -128,6 +128,97 @@ def download_video_temp(file_id):
     return retry_drive_op(_op)
 
 
+def build_team_standings_df(db_records):
+    """Формирует таблицу командного зачета по сумме 10 лучших результатов каждой школы."""
+    if not db_records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(db_records)
+    if "coach_fio" not in df.columns:
+        df["coach_fio"] = "—"
+    df["score"] = df["verified_reps"].fillna(0).astype(int)
+
+    team_rows = []
+    for sch, group in df.groupby("school"):
+        total_m = len(group)
+        checked_m = len(group[group["status"] == "Проверено"])
+        top10_sum = int(group.sort_values(by="score", ascending=False).head(10)["score"].sum())
+        coach_name = group["coach_fio"].iloc[-1] if "coach_fio" in group.columns else "—"
+        team_rows.append({
+            "Школа": sch,
+            "Тренер (представитель)": coach_name,
+            "Заявлено (10–12 чел.)": f"{total_m} чел.",
+            "Проверено": f"{checked_m} из {total_m}",
+            "Допуск команды (≥10 чел.)": "✅ Допущена" if total_m >= 10 else "⏳ Некомплект (<10)",
+            "Сумма 10 лучших": top10_sum,
+            "_is_eligible": 1 if total_m >= 10 else 0
+        })
+
+    df_teams = pd.DataFrame(team_rows).sort_values(
+        by=["_is_eligible", "Сумма 10 лучших"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+    df_teams.insert(0, "Место", range(1, len(df_teams) + 1))
+    return df_teams.drop(columns=["_is_eligible"])
+
+
+def build_school_roster_df(school_entries):
+    """Формирует таблицу участников внутри конкретной школы с отметкой вхождения в Топ-10."""
+    sorted_entries = sorted(
+        school_entries,
+        key=lambda x: (
+            1 if x.get("status") == "Проверено" else 0,
+            int(x["verified_reps"]) if x.get("verified_reps") is not None else -1,
+            int(x.get("claimed_reps", 0))
+        ),
+        reverse=True
+    )
+
+    checked_ids_top10 = {
+        x["id"] for x in sorted_entries
+        if x.get("status") == "Проверено" and x.get("verified_reps") is not None
+    }
+    # Берем первые 10 лучших среди проверенных
+    checked_ordered = [
+        x["id"] for x in sorted_entries
+        if x["id"] in checked_ids_top10
+    ][:10]
+    top10_set = set(checked_ordered)
+
+    rows = []
+    for idx, item in enumerate(sorted_entries, start=1):
+        is_checked = item.get("status") == "Проверено"
+        v_reps = item.get("verified_reps")
+
+        if not is_checked or v_reps is None:
+            top10_label = "⏳ Ожидание проверки"
+            status_label = "🟡 На проверке"
+            v_reps_display = "—"
+        else:
+            v_reps_display = str(int(v_reps))
+            status_label = "🟢 Проверено"
+            top10_label = "✅ В зачете Топ-10" if item["id"] in top10_set else "➖ Запасной (11–12)"
+
+        err_list = item.get("errors", [])
+        if is_checked:
+            err_text = ", ".join(err_list) if err_list else "Без замечаний"
+        else:
+            err_text = "В очереди на проверку"
+
+        rows.append({
+            "№": idx,
+            "ФИО участника": item.get("fio", "—"),
+            "Класс": item.get("grade", "—"),
+            "Заявлено": item.get("claimed_reps", 0),
+            "Засчитано": v_reps_display,
+            "Учет в Топ-10": top10_label,
+            "Статус": status_label,
+            "Примечание судейской системы": err_text
+        })
+
+    return pd.DataFrame(rows)
+
+
 # --- ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ СЕССИИ ---
 if "db" not in st.session_state:
     try:
@@ -145,15 +236,15 @@ if "active_school" not in st.session_state:
 # --- ШАПКА ПРИЛОЖЕНИЯ ---
 st.title("🏆 Турнир по подтягиванию на перекладине памяти героев СВО")
 st.markdown(
-    "**Дистанционный формат (20–27 октября)** | **Участники:** 8–9 классы (Московская область) | "
-    "**Команда:** 10–12 человек (зачет по сумме 10 лучших)"
+    "**Сроки проведения:** 20–27 октября | **Участники:** 8–9 классы (Московская область) | "
+    "**Формат:** Командный зачет (состав команды 10–12 человек, зачет по сумме 10 лучших результатов)"
 )
 
 with st.expander("🤖 Архитектура компьютерного зрения (Pose Estimation) и критерии"):
     st.markdown("""
     * **Отслеживание ключевых точек (MediaPipe Pose):** кисти, локти, плечи, подбородок, тазобедренные суставы, колени и лодыжки.
-    * **Контроль исходного положения (ИП):** разгибание локтей 168°–180°, прямые ноги, сведенные стопы без скрещивания, обязательная фиксация неподвижного виса **не менее 1,0 секунды** перед началом каждого подъема.
-    * **Контроль подъема и верхней точки:** пересечение координатой Y подбородка горизонтальной линии грифа перекладины, симметрия сгибания левой и правой руки, отсутствие рывков и махов тазом/ногами.
+    * **Контроль исходного положения (ИП):** вис хватом сверху, руки и ноги прямые, ступни вместе без скрещивания, обязательная фиксация неподвижного виса **не менее 1,0 секунды** перед началом каждого подъема.
+    * **Контроль подъема и верхней точки:** пересечение подбородком горизонтальной линии грифа перекладины, равномерное сгибание рук без рывков и махов ногами (туловищем).
     """)
 
 st.divider()
@@ -161,17 +252,17 @@ st.divider()
 # =====================================================================
 # БЛОК 1: РЕГИСТРАЦИЯ ШКОЛЫ (1 РАЗ) И ПОСЛЕДОВАТЕЛЬНОЕ ДОБАВЛЕНИЕ УЧАСТНИКОВ
 # =====================================================================
-col_reg, col_board = st.columns([1.05, 1.35], gap="large")
+col_reg, col_board = st.columns([1.0, 1.4], gap="large")
 
 with col_reg:
-    st.subheader("📥 Регистрация команды и участников")
+    st.subheader("📥 Регистрация команды школы")
 
     # Если школа еще не зафиксирована в текущей сессии — показываем Шаг 1
     if st.session_state.active_school is None:
         st.markdown("##### Шаг 1. Данные школы и тренера (вводятся один раз)")
 
         existing_schools = sorted({x["school"] for x in st.session_state.db if x.get("school")})
-        mode = "Новая школа"
+        mode = "Зарегистрировать новую школу"
         if existing_schools:
             mode = st.radio(
                 "Выберите режим:",
@@ -229,7 +320,7 @@ with col_reg:
         st.info(
             f"🏫 **Школа:** {act['school']}  \n"
             f"👨‍🏫 **Тренер:** {act['coach_fio']} ({act['coach_phone']})  \n"
-            f"👥 **Добавлено участников:** **{count_added} из 12** "
+            f"👥 **Участников в команде:** **{count_added} из 12** "
             f"{'(✅ Командный минимум 10 чел. выполнен)' if count_added >= 10 else f'(Для зачета нужно еще мин. {10 - count_added} чел.)'}"
         )
 
@@ -237,9 +328,9 @@ with col_reg:
             st.session_state.active_school = None
             st.rerun()
 
-        st.markdown("##### Шаг 2. Добавление участника в выбранную школу")
+        st.markdown("##### Шаг 2. Добавление участника в команду школы")
         if count_added >= 12:
-            st.warning(f"Достигнут максимальный лимит для школы «{act['school']}» (12 участников).")
+            st.warning(f"Достигнут максимальный лимит для команды школы «{act['school']}» (12 участников).")
         else:
             with st.form("add_participant_form", clear_on_submit=True):
                 fio = st.text_input("ФИО участника*", placeholder="Иванов Иван Иванович").strip()
@@ -286,62 +377,46 @@ with col_reg:
                             st.rerun()
 
         if school_entries:
-            with st.expander(f"📋 Список добавленных участников школы «{act['school']}» ({count_added} чел.)"):
-                df_sch = pd.DataFrame(school_entries)[["fio", "grade", "claimed_reps", "verified_reps", "status"]]
-                df_sch.columns = ["ФИО участника", "Класс", "Заявлено", "Засчитано", "Статус"]
-                st.dataframe(df_sch, use_container_width=True, hide_index=True)
+            with st.expander(f"📋 Текущий состав команды «{act['school']}» ({count_added} чел.)", expanded=True):
+                st.dataframe(build_school_roster_df(school_entries), use_container_width=True, hide_index=True)
 
 # =====================================================================
-# БЛОК 2: ОНЛАЙН-ТАБЛО РЕЗУЛЬТАТОВ
+# БЛОК 2: ОНЛАЙН-ТАБЛО КОМАНДНОГО ЗАЧЕТА + РАСКРЫВАЮЩИЕСЯ СОСТАВЫ ШКОЛ
 # =====================================================================
 with col_board:
     col_title, col_sync = st.columns([3, 1])
     with col_title:
-        st.subheader("📊 Онлайн-табло результатов")
+        st.subheader("🏫 Командный зачет (Сумма 10 лучших)")
     with col_sync:
         if st.button("🔄 Обновить", use_container_width=True):
             st.session_state.db = load_db()
             st.rerun()
 
     if not st.session_state.db:
-        st.info("Заявки пока не поступали.")
+        st.info("Заявки от команд школ пока не поступали.")
     else:
-        df = pd.DataFrame(st.session_state.db)
-        if "coach_fio" not in df.columns:
-            df["coach_fio"] = "—"
-        if "coach_phone" not in df.columns:
-            df["coach_phone"] = "—"
-        df["score"] = df["verified_reps"].fillna(0).astype(int)
+        df_teams = build_team_standings_df(st.session_state.db)
+        st.dataframe(df_teams, use_container_width=True, hide_index=True)
+        st.caption(
+            "💡 Итоговый результат команды определяется по сумме 10 лучших результатов участников школы "
+            "(состав команды: не менее 10 и не более 12 человек)."
+        )
 
-        tab_team, tab_ind = st.tabs(["🏫 Командный зачет (Сумма 10 лучших)", "🥇 Личный зачет"])
+        st.markdown("##### 📋 Составы команд и статус проверки участников по школам")
+        for _, team_row in df_teams.iterrows():
+            rank = team_row["Место"]
+            sch_name = team_row["Школа"]
+            top10_val = team_row["Сумма 10 лучших"]
+            checked_info = team_row["Проверено"]
+            coach_str = team_row["Тренер (представитель)"]
 
-        with tab_team:
-            team_rows = []
-            for sch, group in df.groupby("school"):
-                total_m = len(group)
-                checked_m = len(group[group["status"] == "Проверено"])
-                top10_sum = group.sort_values(by="score", ascending=False).head(10)["score"].sum()
-                coach_name = group["coach_fio"].iloc[-1] if "coach_fio" in group.columns else "—"
-                team_rows.append({
-                    "Школа": sch,
-                    "Тренер": coach_name,
-                    "Участников (10–12)": f"{total_m} чел.",
-                    "Проверено": f"{checked_m} из {total_m}",
-                    "Допуск (≥10 чел.)": "✅ Допущена" if total_m >= 10 else "⏳ Некомплект",
-                    "Сумма 10 лучших": top10_sum
-                })
-            st.dataframe(
-                pd.DataFrame(team_rows).sort_values(by="Сумма 10 лучших", ascending=False),
-                use_container_width=True, hide_index=True
-            )
-
-        with tab_ind:
-            df_ind = df[["fio", "school", "grade", "coach_fio", "claimed_reps", "verified_reps", "status"]].copy()
-            df_ind.columns = ["ФИО", "Школа", "Класс", "Тренер", "Заявлено", "Засчитано", "Статус"]
-            st.dataframe(
-                df_ind.sort_values(by="Засчитано", ascending=False, na_position="last"),
-                use_container_width=True, hide_index=True
-            )
+            sch_entries = [x for x in st.session_state.db if x.get("school") == sch_name]
+            with st.expander(
+                f"Место #{rank} | 🏫 {sch_name} — Сумма Топ-10: {top10_val} | "
+                f"Проверено: {checked_info} | Тренер: {coach_str}"
+            ):
+                df_roster = build_school_roster_df(sch_entries)
+                st.dataframe(df_roster, use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -366,14 +441,16 @@ if judge_pwd:
                     horizontal=True
                 )
             with c_exp:
-                df_exp = pd.DataFrame(st.session_state.db).drop(columns=["reps_detail"], errors="ignore")
+                df_teams_exp = build_team_standings_df(st.session_state.db)
+                df_details_exp = pd.DataFrame(st.session_state.db).drop(columns=["reps_detail"], errors="ignore")
                 buf = io.BytesIO()
                 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                    df_exp.to_excel(writer, index=False, sheet_name="Протокол")
+                    df_teams_exp.to_excel(writer, index=False, sheet_name="Командный зачет")
+                    df_details_exp.to_excel(writer, index=False, sheet_name="Участники по школам")
                 st.download_button(
-                    "📥 Скачать сводный протокол (Excel)",
+                    "📥 Скачать протокол командного зачета (Excel)",
                     data=buf.getvalue(),
-                    file_name=f"Протокол_Подтягивание_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                    file_name=f"Командный_протокол_Подтягивание_{datetime.now().strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
@@ -397,7 +474,7 @@ if judge_pwd:
 
                 with st.expander(
                     f"🏫 {school_name} | Участников: {len(all_school_entries)} (Проверено: {checked_count}/{len(all_school_entries)}) | "
-                    f"Сумма Топ-10: {school_top10_sum} | Тренер: {coach_fio_val} ({coach_phone_val})",
+                    f"Командная сумма (Топ-10): {school_top10_sum} | Тренер: {coach_fio_val} ({coach_phone_val})",
                     expanded=(len(unchecked_entries) > 0)
                 ):
                     st.markdown(
@@ -465,7 +542,6 @@ if judge_pwd:
                                             st.session_state.tracked_videos[item["id"]] = vf.read()
                                         os.remove(tracked_path)
 
-                                    # Сохраняем базу после каждого участника, чтобы ничего не потерялось
                                     save_db(st.session_state.db)
                             except Exception as e:
                                 st.error(f"Ошибка при обработке участника {item['fio']}: {e}")
@@ -494,7 +570,7 @@ if judge_pwd:
                     for entry in school_filtered:
                         with st.expander(
                             f"{'🟢' if entry['status']=='Проверено' else '🟡'} {entry['fio']} ({entry['grade']}) | "
-                            f"Заявлено: {entry['claimed_reps']} | Засчитано: {entry['verified_reps'] if entry['verified_reps'] is not None else '—'}"
+                            f"Заявлено: {entry['claimed_reps']} | Засчитано в зачет школы: {entry['verified_reps'] if entry['verified_reps'] is not None else '—'}"
                         ):
                             col_left, col_right = st.columns([1.2, 1.3])
 
@@ -587,7 +663,7 @@ if judge_pwd:
 
                             with col_right:
                                 verified_val = st.number_input(
-                                    "Итоговое количество ЧИСТЫХ подтягиваний (в зачет):",
+                                    "Итоговое количество ЧИСТЫХ подтягиваний (в зачет команды):",
                                     min_value=0, max_value=100,
                                     value=int(entry["verified_reps"]) if entry["verified_reps"] is not None else int(entry["claimed_reps"]),
                                     key=f"val_{entry['id']}"
@@ -601,7 +677,7 @@ if judge_pwd:
 
                                 b_save, b_del = st.columns([3, 1])
                                 with b_save:
-                                    if st.button("💾 Утвердить в протокол", key=f"save_{entry['id']}", use_container_width=True):
+                                    if st.button("💾 Утвердить в командный протокол", key=f"save_{entry['id']}", use_container_width=True):
                                         entry["verified_reps"] = verified_val
                                         entry["comment"] = judge_comment
                                         entry["status"] = "Проверено"
