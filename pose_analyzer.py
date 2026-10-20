@@ -4,26 +4,25 @@ import os
 import shutil
 import subprocess
 import tempfile
-import urllib.request
 import cv2
-import mediapipe as mp
 import numpy as np
+from ultralytics import YOLO
 
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/"
-    "pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
-)
+# По умолчанию используется модель среднего размера (оптимальный баланс точности и скорости).
+# Возможные варианты: "yolov8n-pose.pt", "yolov8s-pose.pt", "yolov8m-pose.pt", "yolov8l-pose.pt"
+YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8m-pose.pt")
+_MODEL_INSTANCE = None
 
 # =====================================================================
 # КОНФИГУРАТОР ПАРАМЕТРОВ И ОГРАНИЧЕНИЙ АЛГОРИТМА (П. 1 - 26 + СТАБИЛИЗАЦИЯ)
 # =====================================================================
 CONFIG = {
     # 1. Фиксация ИП перед стартом (с)
-    "min_hang_sec": 0.55,
+    "min_hang_sec": 0.85,
     # 2. Угол локтей в нижнем висе (градусы)
     "elbow_ext_angle": 166.0,
     # 3. Максимальное время нахождения на полусогнутых руках (148..166 град) перед стартом тяги (с)
-    "pre_bend_max_time": 0.55,
+    "pre_bend_max_time": 0.65,
     # 4. Порог начала движения / старт тяги (градусы)
     "pull_start_angle": 148.0,
     # 5. Минимальная глубина движения (градусы)
@@ -31,34 +30,34 @@ CONFIG = {
     # 6. Минимальная длительность попытки (с)
     "min_rep_duration": 0.45,
     # 7. Допуск высоты подбородка относительно грифа (доля высоты кадра)
-    "chin_bar_tolerance": 0.003,
+    "chin_bar_tolerance": 0.006,
     # 8. Максимальный угол локтей в пике (градусы)
     "max_peak_elbow_angle": 48.0,
     # 9. Высота носа над грифом (доля высоты кадра)
-    "nose_bar_margin": -0.015,
-    # 9а. Максимально допустимое расстояние от грифа до линии плеч в пике (отсекает недотяг на 00:38)
-    "max_peak_shoulder_drop": 0.058,
-    # 10. Число подтвержденных кадров пика (минимум 2 кадра, чтобы исключить случайный 1-кадровый выброс)
-    "min_chin_above_frames": 3,
+    "nose_bar_margin": -0.010,
+    # 9а. Максимально допустимое расстояние от грифа до линии плеч в пике (отсекает недотяг)
+    "max_peak_shoulder_drop": 0.052,
+    # 10. Число подтвержденных кадров пика
+    "min_chin_above_frames": 1,
     # 11. Порог прямоты ног / 2D-угол в коленях (градусы)
-    "knee_bent_threshold": 148.0,
+    "knee_bent_threshold": 145.0,
     # 12. Порог захлеста голеней назад 3D (доля длины бедра)
     "shin_ratio_threshold": 0.66,
-    # 13. Длительность ошибки согнутых коленей (18% кадров, мин. 3 кадра)
-    "knee_err_frame_ratio": 0.18,
-    "knee_err_min_frames": 3,
-    # 14. Порог скрещивания ног (отлавливает попытку № 8 на 00:43-00:45 и защищает параллельные сомкнутые ноги)
-    "cross_product_threshold": -0.00030,
-    "cross_min_overlap_ratio": 0.15,
+    # 13. Длительность ошибки согнутых коленей (20% кадров, мин. 4 кадра)
+    "knee_err_frame_ratio": 0.20,
+    "knee_err_min_frames": 4,
+    # 14. Порог скрещивания ног (исключает шум при сомкнутых ступнях)
+    "cross_product_threshold": -0.0002,
+    "cross_min_overlap_ratio": 0.14,
     # 15. Длительность ошибки скрещивания (мин. 3 кадра)
-    "cross_err_min_frames": 6,
+    "cross_err_min_frames": 3,
     # 16. Разведение ног / ступни не вместе (120% ширины плеч)
     "feet_apart_ratio": 1.20,
     # 17. Длительность разведения ног (25% кадров, мин. 5 кадров)
     "feet_apart_frame_ratio": 0.25,
     "feet_apart_min_frames": 5,
     # 18. Рывок тазом / угол в тазобедренном суставе (градусы)
-    "hip_kipping_angle": 152.0,
+    "hip_kipping_angle": 151.0,
     # 18а. Изгиб центральной оси тела (плечи - таз - колени) при махе (градусы)
     "center_body_bend_angle": 165.0,
     # 19. Горизонтальный вынос таза от оси плеч (60% ширины плеч)
@@ -67,50 +66,49 @@ CONFIG = {
     "ankle_swing_ratio": 0.52,
     # 20а. Размах горизонтального раскачивания стоп за попытку (58% ширины плеч)
     "ankle_swing_span_ratio": 0.58,
-    # 21. Длительность ошибки маха/рывка (22% кадров, мин. 4 кадра)
-    "kipping_frame_ratio": 0.22,
-    "kipping_min_frames": 4,
+    # 21. Длительность ошибки маха/рывка (25% кадров, мин. 5 кадров)
+    "kipping_frame_ratio": 0.25,
+    "kipping_min_frames": 5,
     # 22. Асимметрия: чистая разница углов в локтях сверх калибровки (градусы)
-    "asym_elbow_diff_deg": 16.0,
-    # 23. Асимметрия: перекос линии локтей (13% ширины плеч — отлавливает попытку № 9 на 00:56)
-    "asym_elbow_tilt_ratio": 0.15,
-    # 24. Асимметрия: перекос линии плеч (13% ширины плеч)
-    "asym_shoulder_tilt_ratio": 0.15,
-    # 25. Длительность поочередного сгибания рук (15% кадров, мин. 3 кадра)
-    "asym_frame_ratio": 0.15,
-    "asym_min_frames": 3,
+    "asym_elbow_diff_deg": 18.0,
+    # 23. Асимметрия: перекос линии локтей (14% ширины плеч)
+    "asym_elbow_tilt_ratio": 0.14,
+    # 24. Асимметрия: перекос линии плеч (14% ширины плеч)
+    "asym_shoulder_tilt_ratio": 0.14,
+    # 25. Длительность поочередного сгибания рук (16% кадров, мин. 4 кадра)
+    "asym_frame_ratio": 0.16,
+    "asym_min_frames": 4,
     # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
     "bar_release_dist": 0.16,
     # --- ПАРАМЕТРЫ СТАБИЛИЗАЦИИ СКЕЛЕТА (1€ FILTER + ЗАЩИТА ОТ СХЛОПЫВАНИЯ) ---
     "filter_min_cutoff_x": 0.65,
     "filter_beta_x": 0.04,
-    "filter_min_cutoff_y": 1.45,
-    "filter_beta_y": 0.40,
+    "filter_min_cutoff_y": 1.35,
+    "filter_beta_y": 0.35,
     "skeleton_collapse_ratio": 0.68,
     "max_joint_jump_per_frame": 0.085,
 }
 
 
 class LM:
+    """Индексы ключевых точек стандарта COCO 17 (используются в YOLOv8-Pose)."""
     NOSE = 0
-    MOUTH_LEFT = 9
-    MOUTH_RIGHT = 10
-    LEFT_SHOULDER = 11
-    RIGHT_SHOULDER = 12
-    LEFT_ELBOW = 13
-    RIGHT_ELBOW = 14
-    LEFT_WRIST = 15
-    RIGHT_WRIST = 16
-    LEFT_PINKY = 17
-    RIGHT_PINKY = 18
-    LEFT_INDEX = 19
-    RIGHT_INDEX = 20
-    LEFT_HIP = 23
-    RIGHT_HIP = 24
-    LEFT_KNEE = 25
-    RIGHT_KNEE = 26
-    LEFT_ANKLE = 27
-    RIGHT_ANKLE = 28
+    LEFT_EYE = 1
+    RIGHT_EYE = 2
+    LEFT_EAR = 3
+    RIGHT_EAR = 4
+    LEFT_SHOULDER = 5
+    RIGHT_SHOULDER = 6
+    LEFT_ELBOW = 7
+    RIGHT_ELBOW = 8
+    LEFT_WRIST = 9
+    RIGHT_WRIST = 10
+    LEFT_HIP = 11
+    RIGHT_HIP = 12
+    LEFT_KNEE = 13
+    RIGHT_KNEE = 14
+    LEFT_ANKLE = 15
+    RIGHT_ANKLE = 16
 
 
 POSE_CONNECTIONS = [
@@ -130,7 +128,7 @@ POSE_CONNECTIONS = [
 
 
 class StabilizedLandmark:
-    """Контейнер ключевой точки, совместимый с MediaPipe NormalizedLandmark."""
+    """Унифицированный контейнер ключевой точки."""
     __slots__ = ("x", "y", "z", "visibility", "presence")
 
     def __init__(self, x, y, z=0.0, visibility=1.0, presence=1.0):
@@ -139,6 +137,107 @@ class StabilizedLandmark:
         self.z = float(z)
         self.visibility = float(visibility)
         self.presence = float(presence)
+
+
+def get_yolo_model():
+    """Ленивая загрузка модели YOLOv8-Pose (кешируется в памяти процесса)."""
+    global _MODEL_INSTANCE
+    if _MODEL_INSTANCE is None:
+        _MODEL_INSTANCE = YOLO(YOLO_MODEL_NAME)
+    return _MODEL_INSTANCE
+
+
+def select_target_athlete(yolo_result, prev_center=None):
+    """
+    Выбирает целевого спортсмена на турнике из всех людей в кадре (защита от людей на фоне).
+    Возвращает (список из 17 StabilizedLandmark, новый_центр_масс) или (None, prev_center).
+    """
+    if (
+        yolo_result is None
+        or yolo_result.keypoints is None
+        or yolo_result.keypoints.xyn is None
+    ):
+        return None, prev_center
+
+    xyn_all = yolo_result.keypoints.xyn.cpu().numpy()
+    if len(xyn_all) == 0:
+        return None, prev_center
+
+    conf_all = (
+        yolo_result.keypoints.conf.cpu().numpy()
+        if yolo_result.keypoints.conf is not None
+        else np.ones((len(xyn_all), 17), dtype=np.float32)
+    )
+    boxes_xywhn = (
+        yolo_result.boxes.xywhn.cpu().numpy()
+        if (yolo_result.boxes is not None and yolo_result.boxes.xywhn is not None)
+        else None
+    )
+
+    best_idx = -1
+    best_score = -1e9
+
+    for i in range(len(xyn_all)):
+        kpts = xyn_all[i]
+        confs = conf_all[i]
+
+        # Проверяем, что плечи и бедрадетектированы
+        sh_valid = confs[LM.LEFT_SHOULDER] > 0.25 and confs[LM.RIGHT_SHOULDER] > 0.25
+        if not sh_valid:
+            continue
+
+        cx = float(
+            0.5 * (kpts[LM.LEFT_SHOULDER][0] + kpts[LM.RIGHT_SHOULDER][0])
+        )
+        cy = float(
+            0.5 * (kpts[LM.LEFT_SHOULDER][1] + kpts[LM.RIGHT_SHOULDER][1])
+        )
+
+        if boxes_xywhn is not None and i < len(boxes_xywhn):
+            _, _, bw, bh = boxes_xywhn[i]
+            area = float(bw * bh)
+        else:
+            area = float(
+                abs(kpts[LM.LEFT_ANKLE][1] - kpts[LM.LEFT_SHOULDER][1])
+                * abs(kpts[LM.LEFT_SHOULDER][0] - kpts[LM.RIGHT_SHOULDER][0])
+            )
+
+        # Бонус, если запястья подняты выше плеч или на уровне головы (поза виса/тяги)
+        wrists_y = 0.5 * (kpts[LM.LEFT_WRIST][1] + kpts[LM.RIGHT_WRIST][1])
+        hands_up_bonus = 0.35 if wrists_y < cy + 0.05 else -0.25
+
+        # Близость к центру кадра
+        center_dist = math.hypot(cx - 0.5, cy - 0.45)
+
+        if prev_center is not None:
+            # Жесткая привязка к уже отслеживаемому спортсмену между кадрами
+            track_dist = math.hypot(cx - prev_center[0], cy - prev_center[1])
+            if track_dist > 0.28:
+                continue
+            score = -3.0 * track_dist + 1.5 * area + hands_up_bonus
+        else:
+            score = 2.2 * area - 0.8 * center_dist + hands_up_bonus
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx < 0:
+        return None, prev_center
+
+    chosen_kpts = xyn_all[best_idx]
+    chosen_confs = conf_all[best_idx]
+    landmarks = []
+    for pt_idx in range(17):
+        x, y = float(chosen_kpts[pt_idx][0]), float(chosen_kpts[pt_idx][1])
+        c = float(chosen_confs[pt_idx])
+        landmarks.append(StabilizedLandmark(x, y, 0.0, visibility=c, presence=c))
+
+    new_center = (
+        0.5 * (landmarks[LM.LEFT_SHOULDER].x + landmarks[LM.RIGHT_SHOULDER].x),
+        0.5 * (landmarks[LM.LEFT_SHOULDER].y + landmarks[LM.RIGHT_SHOULDER].y),
+    )
+    return landmarks, new_center
 
 
 class OneEuroFilter:
@@ -186,19 +285,14 @@ class OneEuroFilter:
 
 
 class SkeletonStabilizer:
-    """Стабилизатор скелета: подавление выбросов, защита от схлопывания и 1€-фильтрация."""
+    """Стабилизатор 17-точечного скелета YOLOv8: подавление выбросов, защита от схлопывания и 1€-фильтрация."""
 
-    HAND_INDICES = {
-        LM.LEFT_WRIST, LM.RIGHT_WRIST,
-        LM.LEFT_PINKY, LM.RIGHT_PINKY,
-        LM.LEFT_INDEX, LM.RIGHT_INDEX,
-    }
+    HAND_INDICES = {LM.LEFT_WRIST, LM.RIGHT_WRIST}
 
     def __init__(self, config=CONFIG):
         self.cfg = config
         self.filters_x = {}
         self.filters_y = {}
-        self.filters_z = {}
         self.prev_pts = None
 
         self.orientation_sign = None
@@ -221,8 +315,7 @@ class SkeletonStabilizer:
                 min_cutoff=self.cfg["filter_min_cutoff_y"],
                 beta=self.cfg["filter_beta_y"],
             )
-            self.filters_z[idx] = OneEuroFilter(min_cutoff=0.5, beta=0.02)
-        return self.filters_x[idx], self.filters_y[idx], self.filters_z[idx]
+        return self.filters_x[idx], self.filters_y[idx]
 
     def _restore_pair_width(self, pts, left_idx, right_idx, min_width, target_width):
         lx, rx = pts[left_idx].x, pts[right_idx].x
@@ -257,27 +350,24 @@ class SkeletonStabilizer:
 
     def process(self, raw_landmarks, timestamp_sec, bar_y=None):
         pts = [
-            StabilizedLandmark(
-                lm.x,
-                lm.y,
-                getattr(lm, "z", 0.0),
-                getattr(lm, "visibility", 1.0),
-                getattr(lm, "presence", 1.0),
-            )
+            StabilizedLandmark(lm.x, lm.y, lm.z, lm.visibility, lm.presence)
             for lm in raw_landmarks
         ]
 
+        # Защита от нулевых координат (если точка не видна в кадре) и резких выбросов
         if self.prev_pts is not None:
             max_jump = self.cfg["max_joint_jump_per_frame"]
             for idx, p in enumerate(pts):
                 prev_p = self.prev_pts[idx]
-                conf = min(p.visibility, p.presence)
-                dist = math.hypot(p.x - prev_p.x, p.y - prev_p.y)
+                conf = p.visibility
+                if (p.x <= 1e-4 and p.y <= 1e-4) or conf < 0.20:
+                    p.x, p.y = prev_p.x, prev_p.y
+                    continue
 
+                dist = math.hypot(p.x - prev_p.x, p.y - prev_p.y)
                 if conf < 0.45:
-                    blend = 0.25
-                    p.x = prev_p.x + blend * (p.x - prev_p.x)
-                    p.y = prev_p.y + blend * (p.y - prev_p.y)
+                    p.x = prev_p.x + 0.25 * (p.x - prev_p.x)
+                    p.y = prev_p.y + 0.25 * (p.y - prev_p.y)
                 elif dist > max_jump:
                     scale = max_jump / dist
                     p.x = prev_p.x + (p.x - prev_p.x) * scale
@@ -314,26 +404,20 @@ class SkeletonStabilizer:
         if self.ref_sh_w is not None:
             if hands_on_bar and self.ref_wrist_w is not None:
                 self._restore_pair_width(
-                    pts,
-                    LM.LEFT_WRIST,
-                    LM.RIGHT_WRIST,
+                    pts, LM.LEFT_WRIST, LM.RIGHT_WRIST,
                     min_width=self.ref_wrist_w * 0.78,
                     target_width=self.ref_wrist_w,
                 )
 
             sh_collapsed = self._restore_pair_width(
-                pts,
-                LM.LEFT_SHOULDER,
-                LM.RIGHT_SHOULDER,
+                pts, LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER,
                 min_width=self.ref_sh_w * collapse_ratio,
                 target_width=self.ref_sh_w,
             )
 
             target_hip_w = self.ref_hip_w if self.ref_hip_w is not None else (self.ref_sh_w * 0.62)
             hip_collapsed = self._restore_pair_width(
-                pts,
-                LM.LEFT_HIP,
-                LM.RIGHT_HIP,
+                pts, LM.LEFT_HIP, LM.RIGHT_HIP,
                 min_width=target_hip_w * collapse_ratio,
                 target_width=target_hip_w,
             )
@@ -379,36 +463,24 @@ class SkeletonStabilizer:
                 prev_kn_w = abs(self.prev_pts[LM.LEFT_KNEE].x - self.prev_pts[LM.RIGHT_KNEE].x)
                 if kn_w < 0.60 * prev_kn_w:
                     self._restore_pair_width(
-                        pts,
-                        LM.LEFT_KNEE,
-                        LM.RIGHT_KNEE,
+                        pts, LM.LEFT_KNEE, LM.RIGHT_KNEE,
                         min_width=0.65 * prev_kn_w,
                         target_width=prev_kn_w,
                     )
 
         smoothed_pts = []
         for idx, p in enumerate(pts):
-            fx, fy, fz = self._get_filters(idx)
-
+            fx, fy = self._get_filters(idx)
             if hands_on_bar and idx in self.HAND_INDICES:
                 sx = fx.filter(p.x, timestamp_sec, min_cutoff_override=0.18, beta_override=0.008)
                 sy = fy.filter(p.y, timestamp_sec, min_cutoff_override=0.25, beta_override=0.015)
             else:
                 sx = fx.filter(p.x, timestamp_sec)
                 sy = fy.filter(p.y, timestamp_sec)
-
-            sz = fz.filter(p.z, timestamp_sec)
-            smoothed_pts.append(StabilizedLandmark(sx, sy, sz, p.visibility, p.presence))
+            smoothed_pts.append(StabilizedLandmark(sx, sy, 0.0, p.visibility, p.presence))
 
         self.prev_pts = smoothed_pts
         return smoothed_pts
-
-
-def ensure_model_path():
-    model_path = os.path.join(tempfile.gettempdir(), "pose_landmarker_full.task")
-    if not os.path.exists(model_path):
-        urllib.request.urlretrieve(MODEL_URL, model_path)
-    return model_path
 
 
 def calculate_angle(a, b, c):
@@ -425,32 +497,37 @@ def format_timestamp(seconds):
 
 
 def compute_bar_y_from_hands(lm):
-    """Определяет уровень оси перекладины по верхним костяшкам пальцев и запястьям."""
-    l_knuckle_y = min(lm[LM.LEFT_INDEX].y, lm[LM.LEFT_PINKY].y)
-    r_knuckle_y = min(lm[LM.RIGHT_INDEX].y, lm[LM.RIGHT_PINKY].y)
-    knuckle_y = 0.5 * (l_knuckle_y + r_knuckle_y)
+    """
+    Вычисляет уровень перекладины (BAR LINE) для 17 точек COCO:
+    так как в COCO нет точек пальцев (INDEX/PINKY), гриф находится чуть выше запястий
+    на величину ~0.18 от ширины плеч.
+    """
     wrist_y = 0.5 * (lm[LM.LEFT_WRIST].y + lm[LM.RIGHT_WRIST].y)
-    return float(min(knuckle_y - 0.005, wrist_y - 0.022))
+    sh_w = max(0.08, abs(lm[LM.LEFT_SHOULDER].x - lm[LM.RIGHT_SHOULDER].x))
+    return float(max(0.02, wrist_y - 0.18 * sh_w))
 
 
 def compute_anatomical_chin(lm, base_shoulder_w=0.12):
     """
-    Точное вычисление нижней точки подбородка по лицевым ориентирам (нос и уголки рта)
-    с защитой от схлопывания, когда перекладина перекрывает лицо.
+    Вычисляет положение подбородка (CHIN) по 17 точкам COCO (нос, глаза, уши, плечи):
+    1) Использует расстояние от линии глаз до носа и ширину плеч для точной оценки высоты нижней челюсти.
+    2) Ограничивает подбородок относительно линии плеч, чтобы при перекрытии лица грифом точка CHIN не прыгала вверх.
     """
     nose_x, nose_y = lm[LM.NOSE].x, lm[LM.NOSE].y
-    mouth_x = 0.5 * (lm[LM.MOUTH_LEFT].x + lm[LM.MOUTH_RIGHT].x)
-    raw_mouth_y = 0.5 * (lm[LM.MOUTH_LEFT].y + lm[LM.MOUTH_RIGHT].y)
+    shoulder_y = 0.5 * (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y)
+    shoulder_x = 0.5 * (lm[LM.LEFT_SHOULDER].x + lm[LM.RIGHT_SHOULDER].x)
 
-    nose_to_mouth = float(np.clip(
-        raw_mouth_y - nose_y,
-        0.10 * base_shoulder_w,
-        0.24 * base_shoulder_w
-    ))
-    valid_mouth_y = nose_y + nose_to_mouth
-    chin_y = valid_mouth_y + 0.55 * nose_to_mouth
-    chin_x = 0.70 * mouth_x + 0.30 * nose_x
-    return chin_x, float(chin_y)
+    l_eye, r_eye = lm[LM.LEFT_EYE], lm[LM.RIGHT_EYE]
+    if l_eye.visibility > 0.3 and r_eye.visibility > 0.3 and l_eye.y > 0 and r_eye.y > 0:
+        eye_y = 0.5 * (l_eye.y + r_eye.y)
+        eye_to_nose = max(0.01, nose_y - eye_y)
+        chin_drop = np.clip(1.35 * eye_to_nose, 0.20 * base_shoulder_w, 0.34 * base_shoulder_w)
+    else:
+        chin_drop = 0.25 * base_shoulder_w
+
+    chin_y = max(nose_y + chin_drop, shoulder_y - 0.34 * base_shoulder_w)
+    chin_x = 0.80 * nose_x + 0.20 * shoulder_x
+    return float(chin_x), float(chin_y)
 
 
 def draw_skeleton(frame, landmarks, chin_pt=None):
@@ -510,18 +587,12 @@ def get_calibration_preview(video_path, manual_bar_y=None):
 
     h, w, _ = frame.shape
     detected_bar_y = 0.25
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    model_path = ensure_model_path()
-    options = mp.tasks.vision.PoseLandmarkerOptions(
-        base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
-        running_mode=mp.tasks.vision.RunningMode.IMAGE
-    )
-    with mp.tasks.vision.PoseLandmarker.create_from_options(options) as landmarker:
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        res = landmarker.detect(mp_image)
-        if res.pose_landmarks:
-            lm = res.pose_landmarks[0]
+    model = get_yolo_model()
+    preds = model.predict(frame, conf=0.35, verbose=False)
+    if preds:
+        lm, _ = select_target_athlete(preds[0])
+        if lm is not None:
             detected_bar_y = compute_bar_y_from_hands(lm)
             sh_w = max(0.08, abs(lm[LM.LEFT_SHOULDER].x - lm[LM.RIGHT_SHOULDER].x))
             chin_x, chin_y = compute_anatomical_chin(lm, sh_w)
@@ -623,14 +694,12 @@ def analyze_video_pose(
             beta=CONFIG["filter_beta_y"]
         )
 
-        # Сглаживающие буферы по 3 кадрам
         chin_buf = deque(maxlen=3)
         nose_buf = deque(maxlen=3)
         elbow_buf = deque(maxlen=3)
         knee_buf = deque(maxlen=3)
         shoulder_y_buf = deque(maxlen=3)
 
-        # Буферы контроля ИП в висе перед началом тяги
         pre_pull_knee_err = deque(maxlen=25)
         pre_pull_cross_err = deque(maxlen=25)
 
@@ -650,420 +719,385 @@ def analyze_video_pose(
         rep_ankle_x = []
 
         frame_idx = 0
-        last_ts_ms = -1
+        tracked_athlete_center = None
+        model = get_yolo_model()
 
-        model_path = ensure_model_path()
-        options = mp.tasks.vision.PoseLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
-            running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            min_pose_detection_confidence=0.55,
-            min_pose_presence_confidence=0.55,
-            min_tracking_confidence=0.65
-        )
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        with mp.tasks.vision.PoseLandmarker.create_from_options(options) as landmarker:
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            frame_idx += 1
+            current_time = frame_idx / fps
 
-                frame_idx += 1
-                current_time = frame_idx / fps
-                ts_ms = max(last_ts_ms + 1, int(round(current_time * 1000)))
-                last_ts_ms = ts_ms
+            if progress_callback and total_frames > 0 and frame_idx % 10 == 0:
+                progress_callback(min(1.0, frame_idx / total_frames))
 
-                if progress_callback and total_frames > 0 and frame_idx % 10 == 0:
-                    progress_callback(min(1.0, frame_idx / total_frames))
+            if scale < 1.0:
+                frame = cv2.resize(frame, (out_w, out_h))
 
-                if scale < 1.0:
-                    frame = cv2.resize(frame, (out_w, out_h))
+            preds = model.predict(frame, conf=0.35, verbose=False)
+            raw_lm, tracked_athlete_center = (
+                select_target_athlete(preds[0], tracked_athlete_center)
+                if preds
+                else (None, tracked_athlete_center)
+            )
 
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                results = landmarker.detect_for_video(mp_image, ts_ms)
+            mean_elbow_angle = 0.0
+            mean_knee_angle = 180.0
+            chin_above_now = False
 
-                mean_elbow_angle = 0.0
-                mean_knee_angle = 180.0
-                chin_above_now = False
+            if raw_lm is not None:
+                if manual_bar_y is None and len(bar_y_samples) < 60:
+                    bar_y_samples.append(compute_bar_y_from_hands(raw_lm))
+                    bar_y = float(np.median(bar_y_samples))
 
-                if results.pose_landmarks:
-                    raw_lm = results.pose_landmarks[0]
+                lm = stabilizer.process(raw_lm, current_time, bar_y=bar_y)
 
-                    if manual_bar_y is None and not bar_y_samples:
-                        bar_y = compute_bar_y_from_hands(raw_lm)
+                def pt(idx):
+                    return [lm[idx].x, lm[idx].y]
 
-                    lm = stabilizer.process(raw_lm, current_time, bar_y=bar_y)
+                l_sh, r_sh = pt(LM.LEFT_SHOULDER), pt(LM.RIGHT_SHOULDER)
+                l_el, r_el = pt(LM.LEFT_ELBOW), pt(LM.RIGHT_ELBOW)
+                l_wr, r_wr = pt(LM.LEFT_WRIST), pt(LM.RIGHT_WRIST)
+                l_hip, r_hip = pt(LM.LEFT_HIP), pt(LM.RIGHT_HIP)
+                l_kn, r_kn = pt(LM.LEFT_KNEE), pt(LM.RIGHT_KNEE)
+                l_an, r_an = pt(LM.LEFT_ANKLE), pt(LM.RIGHT_ANKLE)
 
-                    def pt(idx):
-                        return [lm[idx].x, lm[idx].y]
+                nose = pt(LM.NOSE)
+                raw_chin_x, raw_chin_y = compute_anatomical_chin(lm, base_shoulder_w)
 
-                    l_sh, r_sh = pt(LM.LEFT_SHOULDER), pt(LM.RIGHT_SHOULDER)
-                    l_el, r_el = pt(LM.LEFT_ELBOW), pt(LM.RIGHT_ELBOW)
-                    l_wr, r_wr = pt(LM.LEFT_WRIST), pt(LM.RIGHT_WRIST)
-                    l_hip, r_hip = pt(LM.LEFT_HIP), pt(LM.RIGHT_HIP)
-                    l_kn, r_kn = pt(LM.LEFT_KNEE), pt(LM.RIGHT_KNEE)
-                    l_an, r_an = pt(LM.LEFT_ANKLE), pt(LM.RIGHT_ANKLE)
+                chin_x = chin_x_filter.filter(raw_chin_x, current_time)
+                filtered_chin_y = chin_y_filter.filter(raw_chin_y, current_time)
+                raw_shoulder_y = (l_sh[1] + r_sh[1]) / 2.0
+                shoulder_center_x = (l_sh[0] + r_sh[0]) / 2.0
 
-                    nose = pt(LM.NOSE)
-                    raw_chin_x, raw_chin_y = compute_anatomical_chin(lm, base_shoulder_w)
+                wrist_y = (l_wr[1] + r_wr[1]) / 2.0
 
-                    mouth_x = chin_x_filter.filter(raw_chin_x, current_time)
-                    filtered_chin_y = chin_y_filter.filter(raw_chin_y, current_time)
-                    raw_shoulder_y = (l_sh[1] + r_sh[1]) / 2.0
-                    shoulder_center_x = (l_sh[0] + r_sh[0]) / 2.0
+                angle_el_l = calculate_angle(l_sh, l_el, l_wr)
+                angle_el_r = calculate_angle(r_sh, r_el, r_wr)
+                raw_elbow = (angle_el_l + angle_el_r) / 2.0
 
-                    wrist_y = (l_wr[1] + r_wr[1]) / 2.0
+                # П. 11-12: угол в коленях и 3D-захлест голеней назад
+                angle_kn_2d = (calculate_angle(l_hip, l_kn, l_an) + calculate_angle(r_hip, r_kn, r_an)) / 2.0
+                thigh_len = (np.hypot(l_kn[0] - l_hip[0], l_kn[1] - l_hip[1]) + np.hypot(r_kn[0] - r_hip[0], r_kn[1] - r_hip[1])) / 2.0
+                shin_len = (np.hypot(l_an[0] - l_kn[0], l_an[1] - l_kn[1]) + np.hypot(r_an[0] - r_kn[0], r_an[1] - r_kn[1])) / 2.0
+                shin_ratio = shin_len / max(0.04, thigh_len)
 
-                    angle_el_l = calculate_angle(l_sh, l_el, l_wr)
-                    angle_el_r = calculate_angle(r_sh, r_el, r_wr)
-                    raw_elbow = (angle_el_l + angle_el_r) / 2.0
+                if shin_ratio < CONFIG["shin_ratio_threshold"]:
+                    sagittal_knee_deg = float(np.degrees(np.arcsin(np.clip(shin_ratio / 0.85, 0.1, 1.0))) * 1.6)
+                    raw_knee = min(angle_kn_2d, sagittal_knee_deg)
+                else:
+                    raw_knee = angle_kn_2d
 
-                    # Калибруем высоту перекладины в спокойном висе
-                    if manual_bar_y is None and raw_elbow >= 162.0 and len(bar_y_samples) < 80:
-                        bar_y_samples.append(compute_bar_y_from_hands(raw_lm))
-                        bar_y = float(np.percentile(bar_y_samples, 35))
+                chin_buf.append(filtered_chin_y)
+                nose_buf.append(nose[1])
+                elbow_buf.append(raw_elbow)
+                knee_buf.append(raw_knee)
+                shoulder_y_buf.append(raw_shoulder_y)
 
-                    # П. 11-12: угол в коленях и 3D-захлест голеней назад
-                    angle_kn_2d = (calculate_angle(l_hip, l_kn, l_an) + calculate_angle(r_hip, r_kn, r_an)) / 2.0
-                    thigh_len = (np.hypot(l_kn[0] - l_hip[0], l_kn[1] - l_hip[1]) + np.hypot(r_kn[0] - r_hip[0], r_kn[1] - r_hip[1])) / 2.0
-                    shin_len = (np.hypot(l_an[0] - l_kn[0], l_an[1] - l_kn[1]) + np.hypot(r_an[0] - r_kn[0], r_an[1] - r_kn[1])) / 2.0
-                    shin_ratio = shin_len / max(0.04, thigh_len)
+                nose_y = float(np.median(nose_buf))
+                shoulder_y = float(np.median(shoulder_y_buf))
+                chin_y = max(
+                    float(np.median(chin_buf)),
+                    nose_y + 0.18 * base_shoulder_w,
+                    shoulder_y - 0.34 * base_shoulder_w
+                )
+                mean_elbow_angle = float(np.median(elbow_buf))
+                mean_knee_angle = float(np.median(knee_buf))
 
-                    if shin_ratio < CONFIG["shin_ratio_threshold"]:
-                        sagittal_knee_deg = float(np.degrees(np.arcsin(np.clip(shin_ratio / 0.85, 0.1, 1.0))) * 1.6)
-                        raw_knee = min(angle_kn_2d, sagittal_knee_deg)
+                mean_hip_angle = (calculate_angle(l_sh, l_hip, l_kn) + calculate_angle(r_sh, r_hip, r_kn)) / 2.0
+                curr_sh_w = abs(l_sh[0] - r_sh[0])
+
+                # Калибровка геометрии спортсмена в спокойном висе
+                if mean_elbow_angle >= 170.0 and curr_sh_w > 0.05 and len(shoulder_w_samples) < 50:
+                    shoulder_w_samples.append(curr_sh_w)
+                    base_shoulder_w = float(np.median(shoulder_w_samples))
+                    base_sh_tilt_samples.append(abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w))
+                    base_el_tilt_samples.append(abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w))
+                    base_el_diff_samples.append(abs(angle_el_l - angle_el_r))
+
+                    base_sh_tilt = float(np.median(base_sh_tilt_samples))
+                    base_el_tilt = float(np.median(base_el_tilt_samples))
+                    base_el_diff = float(np.median(base_el_diff_samples))
+
+                # П. 22-24: детекция асимметрии рук
+                curr_sh_tilt = abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w)
+                curr_el_tilt = abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w)
+                elbow_diff = abs(angle_el_l - angle_el_r)
+
+                net_sh_tilt = max(0.0, curr_sh_tilt - base_sh_tilt)
+                net_el_tilt = max(0.0, curr_el_tilt - base_el_tilt)
+                net_el_diff = max(0.0, elbow_diff - base_el_diff)
+
+                head_fully_in_frame = nose_y > 0.04
+                is_asym_frame = (
+                    head_fully_in_frame
+                    and (15.0 < mean_elbow_angle < 164.0)
+                    and (
+                        net_el_tilt > CONFIG["asym_elbow_tilt_ratio"]
+                        or net_sh_tilt > CONFIG["asym_shoulder_tilt_ratio"]
+                        or (net_el_diff > CONFIG["asym_elbow_diff_deg"] and net_el_tilt > 0.08)
+                    )
+                )
+
+                # П. 11, 12, 14, 16: положение ног и стоп
+                ankle_dx = l_an[0] - r_an[0]
+                knee_dx = l_kn[0] - r_kn[0]
+                hip_dx = l_hip[0] - r_hip[0]
+                hip_w = max(0.04, abs(hip_dx))
+                ankle_dist = abs(ankle_dx)
+                knee_dist = abs(knee_dx)
+                ankle_dy = abs(l_an[1] - r_an[1])
+
+                shins_crossed_x = (
+                    (
+                        ankle_dx * hip_dx < CONFIG["cross_product_threshold"]
+                        or ankle_dx * knee_dx < CONFIG["cross_product_threshold"]
+                    )
+                    and (ankle_dist > hip_w * CONFIG["cross_min_overlap_ratio"])
+                )
+                ankles_stacked_vertically = (
+                    knee_dist > hip_w * 0.45
+                    and (ankle_dist < knee_dist * 0.45 or ankle_dist < hip_w * 0.28)
+                    and ankle_dy > hip_w * 0.20
+                )
+                legs_crossed = shins_crossed_x or ankles_stacked_vertically
+
+                feet_apart = ankle_dist > (base_shoulder_w * CONFIG["feet_apart_ratio"])
+                knees_bent = (
+                    (mean_knee_angle < CONFIG["knee_bent_threshold"])
+                    or (shin_ratio < CONFIG["shin_ratio_threshold"])
+                )
+
+                # П. 18-20: детекция рывков и махов
+                hip_center_x = (l_hip[0] + r_hip[0]) / 2.0
+                hip_center_y = (l_hip[1] + r_hip[1]) / 2.0
+                knee_center_x = (l_kn[0] + r_kn[0]) / 2.0
+                knee_center_y = (l_kn[1] + r_kn[1]) / 2.0
+                ankle_center_x = (l_an[0] + r_an[0]) / 2.0
+
+                center_body_angle = calculate_angle(
+                    [shoulder_center_x, shoulder_y],
+                    [hip_center_x, hip_center_y],
+                    [knee_center_x, knee_center_y]
+                )
+                horizontal_swing = (
+                    abs(hip_center_x - shoulder_center_x) > (base_shoulder_w * CONFIG["hip_swing_ratio"])
+                    or abs(ankle_center_x - hip_center_x) > (base_shoulder_w * CONFIG["ankle_swing_ratio"])
+                )
+                kipping_detected = (
+                    (mean_hip_angle < CONFIG["hip_kipping_angle"])
+                    or (center_body_angle < CONFIG["center_body_bend_angle"])
+                    or horizontal_swing
+                )
+
+                # П. 26: проверка нахождения кистей на перекладине
+                hands_on_bar = abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
+
+                # П. 7, 8, 9: проверка взятия верхней точки
+                chin_reached = (
+                    (
+                        chin_y <= bar_y + CONFIG["chin_bar_tolerance"]
+                        and nose_y <= bar_y + CONFIG["nose_bar_margin"]
+                    )
+                    or (bar_y <= 0.08 and nose_y <= bar_y)
+                )
+                chin_above_now = (
+                    chin_reached
+                    and (mean_elbow_angle <= CONFIG["max_peak_elbow_angle"])
+                    and (shoulder_y <= bar_y + CONFIG["max_peak_shoulder_drop"])
+                )
+
+                if frame_idx <= 5 and state == "WAIT_HANG" and mean_elbow_angle < 65.0 and hands_on_bar:
+                    state = "DESCENDING"
+                    rep_start_time = 0.0
+                    min_elbow_in_rep = mean_elbow_angle
+                    min_shoulder_y_in_rep = shoulder_y
+                    min_chin_y_in_rep = chin_y
+                    chin_above_frames = CONFIG["min_chin_above_frames"] if chin_above_now else 0
+                    rep_errors = set()
+                    rep_frames = 1
+                    asym_frames = knee_bent_frames = legs_crossed_frames = feet_apart_frames = kipping_frames = 0
+                    rep_ankle_x = [ankle_center_x]
+
+                elif state == "WAIT_HANG":
+                    if hands_on_bar:
+                        pre_pull_knee_err.append(1 if knees_bent else 0)
+                        pre_pull_cross_err.append(1 if legs_crossed else 0)
+
+                    if mean_elbow_angle >= elbow_ext_angle and hands_on_bar:
+                        if hang_start_time is None:
+                            hang_start_time = current_time
+                        last_hang_duration = current_time - hang_start_time
+                        pre_bend_frames = 0
                     else:
-                        raw_knee = angle_kn_2d
+                        if (
+                            CONFIG["pull_start_angle"] <= mean_elbow_angle < elbow_ext_angle
+                            and hands_on_bar
+                        ):
+                            pre_bend_frames += 1
 
-                    chin_buf.append(filtered_chin_y)
-                    nose_buf.append(nose[1])
-                    elbow_buf.append(raw_elbow)
-                    knee_buf.append(raw_knee)
-                    shoulder_y_buf.append(raw_shoulder_y)
+                        if mean_elbow_angle < CONFIG["pull_start_angle"] and hands_on_bar:
+                            state = "PULLING"
+                            rep_start_time = current_time
+                            min_elbow_in_rep = mean_elbow_angle
+                            min_shoulder_y_in_rep = shoulder_y
+                            min_chin_y_in_rep = chin_y
+                            chin_above_frames = 1 if chin_above_now else 0
+                            rep_errors = set()
+                            rep_frames = 1
+                            asym_frames = 1 if is_asym_frame else 0
+                            knee_bent_frames = 1 if knees_bent else 0
+                            legs_crossed_frames = 1 if legs_crossed else 0
+                            feet_apart_frames = 1 if feet_apart else 0
+                            kipping_frames = 1 if kipping_detected else 0
+                            rep_ankle_x = [ankle_center_x]
 
-                    nose_y = float(np.median(nose_buf))
-                    shoulder_y = float(np.median(shoulder_y_buf))
-                    chin_y = max(
-                        float(np.median(chin_buf)),
-                        nose_y + 0.16 * base_shoulder_w
-                    )
-                    mean_elbow_angle = float(np.median(elbow_buf))
-                    mean_knee_angle = float(np.median(knee_buf))
+                            if pre_bend_frames > int(CONFIG["pre_bend_max_time"] * fps):
+                                rep_errors.add("нарушение ИП: согнутые в локтях руки перед стартом")
 
-                    mean_hip_angle = (calculate_angle(l_sh, l_hip, l_kn) + calculate_angle(r_sh, r_hip, r_kn)) / 2.0
-                    curr_sh_w = abs(l_sh[0] - r_sh[0])
+                            if sum(pre_pull_knee_err) >= CONFIG["knee_err_min_frames"]:
+                                rep_errors.add("нарушение ИП: согнутые в коленях ноги")
+                            if sum(pre_pull_cross_err) >= CONFIG["cross_err_min_frames"]:
+                                rep_errors.add("нарушение ИП: перекрещенные ноги")
 
-                    # Калибровка геометрии спортсмена в спокойном висе
-                    if mean_elbow_angle >= 170.0 and curr_sh_w > 0.05 and len(shoulder_w_samples) < 50:
-                        shoulder_w_samples.append(curr_sh_w)
-                        base_shoulder_w = float(np.median(shoulder_w_samples))
-                        base_sh_tilt_samples.append(abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w))
-                        base_el_tilt_samples.append(abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w))
-                        base_el_diff_samples.append(abs(angle_el_l - angle_el_r))
+                            is_first_rep_early = (len(reps_log) == 0 and rep_start_time < 2.0)
+                            if not is_first_rep_early and last_hang_duration < min_hang_sec:
+                                rep_errors.add(f"фиксация ИП менее 1.0 сек ({last_hang_duration:.2f} с)")
 
-                        base_sh_tilt = float(np.median(base_sh_tilt_samples))
-                        base_el_tilt = float(np.median(base_el_tilt_samples))
-                        base_el_diff = float(np.median(base_el_diff_samples))
-
-                    # П. 22-24: детекция асимметрии / поочередного сгибания рук (отлавливает попытку № 9 на 00:56)
-                    curr_sh_tilt = abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w)
-                    curr_el_tilt = abs(l_el[1] - r_el[1]) / max(0.06, base_shoulder_w)
-                    elbow_diff = abs(angle_el_l - angle_el_r)
-
-                    net_sh_tilt = max(0.0, curr_sh_tilt - base_sh_tilt)
-                    net_el_tilt = max(0.0, curr_el_tilt - base_el_tilt)
-                    net_el_diff = max(0.0, elbow_diff - base_el_diff)
-
-                    head_fully_in_frame = nose_y > 0.04
-                    is_asym_frame = (
-                        head_fully_in_frame
-                        and (20.0 < mean_elbow_angle < 162.0)
-                        and (
-                            net_el_tilt > CONFIG["asym_elbow_tilt_ratio"]
-                            or net_sh_tilt > CONFIG["asym_shoulder_tilt_ratio"]
-                            or (net_el_diff > CONFIG["asym_elbow_diff_deg"] and net_el_tilt > 0.07)
-                        )
-                    )
-
-                    # П. 11, 12, 14, 16: положение ног и стоп (отлавливает скрещивание в попытке № 8 на 00:43-00:45)
-                    ankle_dx = l_an[0] - r_an[0]
-                    knee_dx = l_kn[0] - r_kn[0]
-                    hip_dx = l_hip[0] - r_hip[0]
-                    hip_w = max(0.04, abs(hip_dx))
-                    ankle_dist = abs(ankle_dx)
-                    knee_dist = abs(knee_dx)
-                    ankle_dy = abs(l_an[1] - r_an[1])
-
-                    # 1) Инверсия знака лодыжек относительно таза/коленей (Х-перехлест)
-                    shins_crossed_x = (
-                        (
-                            ankle_dx * hip_dx < CONFIG["cross_product_threshold"]
-                            or ankle_dx * knee_dx < CONFIG["cross_product_threshold"]
-                        )
-                        and (ankle_dist > hip_w * CONFIG["cross_min_overlap_ratio"] or ankle_dy > hip_w * 0.12)
-                    )
-                    # 2) Наложение одной лодыжки поверх другой (колени шире лодыжек, стопы на разной высоте)
-                    ankles_stacked_vertically = (
-                        knee_dist > hip_w * 0.42
-                        and (ankle_dist < knee_dist * 0.48 or ankle_dist < hip_w * 0.28)
-                        and ankle_dy > hip_w * 0.14
-                    )
-                    legs_crossed = shins_crossed_x or ankles_stacked_vertically
-
-                    feet_apart = ankle_dist > (base_shoulder_w * CONFIG["feet_apart_ratio"])
-                    knees_bent = (
-                        (mean_knee_angle < CONFIG["knee_bent_threshold"])
-                        or (shin_ratio < CONFIG["shin_ratio_threshold"])
-                    )
-
-                    # П. 18-20: детекция реальных рывков и махов
-                    hip_center_x = (l_hip[0] + r_hip[0]) / 2.0
-                    hip_center_y = (l_hip[1] + r_hip[1]) / 2.0
-                    knee_center_x = (l_kn[0] + r_kn[0]) / 2.0
-                    knee_center_y = (l_kn[1] + r_kn[1]) / 2.0
-                    ankle_center_x = (l_an[0] + r_an[0]) / 2.0
-
-                    center_body_angle = calculate_angle(
-                        [shoulder_center_x, shoulder_y],
-                        [hip_center_x, hip_center_y],
-                        [knee_center_x, knee_center_y]
-                    )
-                    horizontal_swing = (
-                        abs(hip_center_x - shoulder_center_x) > (base_shoulder_w * CONFIG["hip_swing_ratio"])
-                        or abs(ankle_center_x - hip_center_x) > (base_shoulder_w * CONFIG["ankle_swing_ratio"])
-                    )
-                    kipping_detected = (
-                        (mean_hip_angle < CONFIG["hip_kipping_angle"])
-                        or (center_body_angle < CONFIG["center_body_bend_angle"])
-                        or horizontal_swing
-                    )
-
-                    # П. 26: проверка нахождения кистей на перекладине
-                    hands_on_bar = (
-                        abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
-                        and wrist_y <= (shoulder_y + 0.04)
-                    )
-
-                    # П. 7, 8, 9, 9а: строгая проверка взятия верхней точки (отсекает недотяг № 7 на 00:38)
-                    chin_reached = (
-                        (
-                            chin_y <= bar_y + CONFIG["chin_bar_tolerance"]
-                            and nose_y <= bar_y + CONFIG["nose_bar_margin"]
-                        )
-                        or (bar_y <= 0.08 and nose_y <= bar_y)
-                    )
-                    chin_above_now = (
-                        chin_reached
-                        and (mean_elbow_angle <= CONFIG["max_peak_elbow_angle"])
-                        and (shoulder_y <= bar_y + CONFIG["max_peak_shoulder_drop"])
-                    )
-
-                    if frame_idx <= 5 and state == "WAIT_HANG" and mean_elbow_angle < 65.0 and hands_on_bar:
-                        state = "DESCENDING"
-                        rep_start_time = 0.0
-                        min_elbow_in_rep = mean_elbow_angle
-                        min_shoulder_y_in_rep = shoulder_y
-                        min_chin_y_in_rep = chin_y
-                        chin_above_frames = CONFIG["min_chin_above_frames"] if chin_above_now else 0
-                        rep_errors = set()
-                        rep_frames = 1
-                        asym_frames = knee_bent_frames = legs_crossed_frames = feet_apart_frames = kipping_frames = 0
-                        rep_ankle_x = [ankle_center_x]
-
-                    elif state == "WAIT_HANG":
-                        if hands_on_bar:
-                            pre_pull_knee_err.append(1 if knees_bent else 0)
-                            pre_pull_cross_err.append(1 if legs_crossed else 0)
-
-                        # П. 2: вис на выпрямленных руках
-                        if mean_elbow_angle >= elbow_ext_angle and hands_on_bar:
-                            if hang_start_time is None:
-                                hang_start_time = current_time
-                            last_hang_duration = current_time - hang_start_time
+                            hang_start_time = None
                             pre_bend_frames = 0
-                        else:
-                            # П. 3: контроль виса на полусогнутых руках перед стартом тяги (отлавливает попытку № 4 на 00:22)
+
+                elif state in ("PULLING", "DESCENDING"):
+                    if not hands_on_bar:
+                        rep_duration = current_time - rep_start_time
+                        if rep_duration >= 0.40 and min_elbow_in_rep <= 115.0:
                             if (
-                                CONFIG["pull_start_angle"] <= mean_elbow_angle < elbow_ext_angle
-                                and hands_on_bar
+                                chin_above_frames < CONFIG["min_chin_above_frames"]
+                                or min_elbow_in_rep > CONFIG["max_peak_elbow_angle"]
                             ):
-                                pre_bend_frames += 1
+                                rep_errors.add("подбородок ниже уровня грифа перекладины")
+                            rep_errors.add("срыв / спрыгивание с перекладины без фиксации виса")
+                            reps_log.append({
+                                "rep_number": len(reps_log) + 1,
+                                "timestamp": f"{format_timestamp(rep_start_time)} – {format_timestamp(current_time)}",
+                                "valid": False,
+                                "status_text": "❌ Не засчитано",
+                                "errors": sorted(rep_errors)
+                            })
+                        state = "WAIT_HANG"
+                        hang_start_time = None
+                        last_hang_duration = 0.0
+                        pre_bend_frames = 0
+                        rep_errors = set()
+                        pre_pull_knee_err.clear()
+                        pre_pull_cross_err.clear()
+                    else:
+                        rep_frames += 1
+                        min_elbow_in_rep = min(min_elbow_in_rep, mean_elbow_angle)
+                        min_shoulder_y_in_rep = min(min_shoulder_y_in_rep, shoulder_y)
+                        min_chin_y_in_rep = min(min_chin_y_in_rep, chin_y)
+                        rep_ankle_x.append(ankle_center_x)
 
-                            # П. 4: старт тяги
-                            if mean_elbow_angle < CONFIG["pull_start_angle"] and hands_on_bar:
-                                state = "PULLING"
-                                rep_start_time = current_time
-                                min_elbow_in_rep = mean_elbow_angle
-                                min_shoulder_y_in_rep = shoulder_y
-                                min_chin_y_in_rep = chin_y
-                                chin_above_frames = 1 if chin_above_now else 0
-                                rep_errors = set()
-                                rep_frames = 1
-                                asym_frames = 1 if is_asym_frame else 0
-                                knee_bent_frames = 1 if knees_bent else 0
-                                legs_crossed_frames = 1 if legs_crossed else 0
-                                feet_apart_frames = 1 if feet_apart else 0
-                                kipping_frames = 1 if kipping_detected else 0
-                                rep_ankle_x = [ankle_center_x]
+                        if chin_above_now:
+                            chin_above_frames += 1
 
-                                if pre_bend_frames > int(CONFIG["pre_bend_max_time"] * fps):
-                                    rep_errors.add("нарушение ИП: согнутые в локтях руки перед стартом")
+                        if is_asym_frame:
+                            asym_frames += 1
+                        if knees_bent:
+                            knee_bent_frames += 1
+                        if legs_crossed:
+                            legs_crossed_frames += 1
+                        if feet_apart:
+                            feet_apart_frames += 1
+                        if kipping_detected:
+                            kipping_frames += 1
 
-                                if sum(pre_pull_knee_err) >= CONFIG["knee_err_min_frames"]:
+                        if state == "PULLING" and (
+                            mean_elbow_angle > min_elbow_in_rep + 12.0
+                            or shoulder_y > min_shoulder_y_in_rep + 0.025
+                        ):
+                            state = "DESCENDING"
+
+                        if state == "DESCENDING" and mean_elbow_angle >= (elbow_ext_angle - 4.0):
+                            rep_duration = current_time - rep_start_time
+
+                            if (
+                                rep_duration >= CONFIG["min_rep_duration"]
+                                and min_elbow_in_rep <= CONFIG["min_pull_depth_angle"]
+                            ):
+                                ankle_swing_span = (max(rep_ankle_x) - min(rep_ankle_x)) if rep_ankle_x else 0.0
+
+                                if asym_frames >= max(CONFIG["asym_min_frames"], int(rep_frames * CONFIG["asym_frame_ratio"])):
+                                    rep_errors.add("поочередное (неравномерное) сгибание рук")
+
+                                if knee_bent_frames >= max(CONFIG["knee_err_min_frames"], int(rep_frames * CONFIG["knee_err_frame_ratio"])):
                                     rep_errors.add("нарушение ИП: согнутые в коленях ноги")
-                                if sum(pre_pull_cross_err) >= CONFIG["cross_err_min_frames"]:
+
+                                if legs_crossed_frames >= CONFIG["cross_err_min_frames"]:
                                     rep_errors.add("нарушение ИП: перекрещенные ноги")
 
-                                # П. 1: контроль времени фиксации ИП
-                                is_first_rep_early = (len(reps_log) == 0 and rep_start_time < 2.0)
-                                if not is_first_rep_early and last_hang_duration < min_hang_sec:
-                                    rep_errors.add(f"фиксация ИП менее 1.0 сек ({last_hang_duration:.2f} с)")
+                                if feet_apart_frames >= max(CONFIG["feet_apart_min_frames"], int(rep_frames * CONFIG["feet_apart_frame_ratio"])):
+                                    rep_errors.add("нарушение ИП: ступни не вместе (ноги разведены)")
 
-                                hang_start_time = None
-                                pre_bend_frames = 0
+                                if (
+                                    kipping_frames >= max(CONFIG["kipping_min_frames"], int(rep_frames * CONFIG["kipping_frame_ratio"]))
+                                    or ankle_swing_span > (base_shoulder_w * CONFIG["ankle_swing_span_ratio"])
+                                ):
+                                    rep_errors.add("подтягивание рывками или с махом ногами/туловищем")
 
-                    elif state in ("PULLING", "DESCENDING"):
-                        if not hands_on_bar:
-                            rep_duration = current_time - rep_start_time
-                            if (
-                                rep_duration >= 0.45
-                                and min_elbow_in_rep <= 95.0
-                                and min_shoulder_y_in_rep <= (bar_y + 0.18)
-                            ):
                                 if (
                                     chin_above_frames < CONFIG["min_chin_above_frames"]
                                     or min_elbow_in_rep > CONFIG["max_peak_elbow_angle"]
                                 ):
                                     rep_errors.add("подбородок ниже уровня грифа перекладины")
-                                rep_errors.add("срыв / спрыгивание с перекладины без фиксации виса")
+
+                                is_valid = len(rep_errors) == 0
                                 reps_log.append({
                                     "rep_number": len(reps_log) + 1,
                                     "timestamp": f"{format_timestamp(rep_start_time)} – {format_timestamp(current_time)}",
-                                    "valid": False,
-                                    "status_text": "❌ Не засчитано",
-                                    "errors": sorted(rep_errors)
+                                    "valid": is_valid,
+                                    "status_text": "✅ Засчитано" if is_valid else "❌ Не засчитано",
+                                    "errors": sorted(rep_errors) if rep_errors else ["Нет ошибок"]
                                 })
+
                             state = "WAIT_HANG"
-                            hang_start_time = None
+                            hang_start_time = current_time
                             last_hang_duration = 0.0
                             pre_bend_frames = 0
                             rep_errors = set()
                             pre_pull_knee_err.clear()
                             pre_pull_cross_err.clear()
-                        else:
-                            rep_frames += 1
-                            min_elbow_in_rep = min(min_elbow_in_rep, mean_elbow_angle)
-                            min_shoulder_y_in_rep = min(min_shoulder_y_in_rep, shoulder_y)
-                            min_chin_y_in_rep = min(min_chin_y_in_rep, chin_y)
-                            rep_ankle_x.append(ankle_center_x)
-
-                            if chin_above_now:
-                                chin_above_frames += 1
-
-                            if is_asym_frame:
-                                asym_frames += 1
-                            if knees_bent:
-                                knee_bent_frames += 1
-                            if legs_crossed:
-                                legs_crossed_frames += 1
-                            if feet_apart:
-                                feet_apart_frames += 1
-                            if kipping_detected:
-                                kipping_frames += 1
-
-                            if state == "PULLING" and (
-                                mean_elbow_angle > min_elbow_in_rep + 12.0
-                                or shoulder_y > min_shoulder_y_in_rep + 0.025
-                            ):
-                                state = "DESCENDING"
-
-                            if state == "DESCENDING" and mean_elbow_angle >= (elbow_ext_angle - 4.0):
-                                rep_duration = current_time - rep_start_time
-
-                                # П. 5, 6: фильтрация по минимальной длительности и глубине сгибания локтей
-                                if (
-                                    rep_duration >= CONFIG["min_rep_duration"]
-                                    and min_elbow_in_rep <= CONFIG["min_pull_depth_angle"]
-                                ):
-                                    ankle_swing_span = (max(rep_ankle_x) - min(rep_ankle_x)) if rep_ankle_x else 0.0
-
-                                    # П. 25: поочередное / неравномерное сгибание рук
-                                    if asym_frames >= max(CONFIG["asym_min_frames"], int(rep_frames * CONFIG["asym_frame_ratio"])):
-                                        rep_errors.add("поочередное (неравномерное) сгибание рук")
-
-                                    # П. 13: согнутые в коленях ноги
-                                    if knee_bent_frames >= max(CONFIG["knee_err_min_frames"], int(rep_frames * CONFIG["knee_err_frame_ratio"])):
-                                        rep_errors.add("нарушение ИП: согнутые в коленях ноги")
-
-                                    # П. 15: перекрещенные ноги
-                                    if legs_crossed_frames >= CONFIG["cross_err_min_frames"]:
-                                        rep_errors.add("нарушение ИП: перекрещенные ноги")
-
-                                    # П. 17: разведение ног
-                                    if feet_apart_frames >= max(CONFIG["feet_apart_min_frames"], int(rep_frames * CONFIG["feet_apart_frame_ratio"])):
-                                        rep_errors.add("нарушение ИП: ступни не вместе (ноги разведены)")
-
-                                    # П. 21: рывки / махи ногами или туловищем
-                                    if (
-                                        kipping_frames >= max(CONFIG["kipping_min_frames"], int(rep_frames * CONFIG["kipping_frame_ratio"]))
-                                        or ankle_swing_span > (base_shoulder_w * CONFIG["ankle_swing_span_ratio"])
-                                    ):
-                                        rep_errors.add("подтягивание рывками или с махом ногами/туловищем")
-
-                                    # П. 7, 8, 9а, 10: строгая проверка взятия верхней точки
-                                    if (
-                                        chin_above_frames < CONFIG["min_chin_above_frames"]
-                                        or min_elbow_in_rep > CONFIG["max_peak_elbow_angle"]
-                                        or min_chin_y_in_rep > (bar_y + CONFIG["chin_bar_tolerance"])
-                                        or min_shoulder_y_in_rep > (bar_y + CONFIG["max_peak_shoulder_drop"])
-                                    ):
-                                        rep_errors.add("подбородок ниже уровня грифа перекладины")
-
-                                    is_valid = len(rep_errors) == 0
-                                    reps_log.append({
-                                        "rep_number": len(reps_log) + 1,
-                                        "timestamp": f"{format_timestamp(rep_start_time)} – {format_timestamp(current_time)}",
-                                        "valid": is_valid,
-                                        "status_text": "✅ Засчитано" if is_valid else "❌ Не засчитано",
-                                        "errors": sorted(rep_errors) if rep_errors else ["Нет ошибок"]
-                                    })
-
-                                state = "WAIT_HANG"
-                                hang_start_time = current_time
-                                last_hang_duration = 0.0
-                                pre_bend_frames = 0
-                                rep_errors = set()
-                                pre_pull_knee_err.clear()
-                                pre_pull_cross_err.clear()
-
-                    if writer is not None:
-                        draw_skeleton(frame, lm, chin_pt=(mouth_x, chin_y))
 
                 if writer is not None:
-                    valid_so_far = sum(1 for r in reps_log if r["valid"])
-                    has_active_err = (
-                        state != "WAIT_HANG"
-                        and (
-                            bool(rep_errors)
-                            or knee_bent_frames >= CONFIG["knee_err_min_frames"]
-                            or legs_crossed_frames >= CONFIG["cross_err_min_frames"]
-                            or asym_frames >= CONFIG["asym_min_frames"]
-                            or kipping_frames >= CONFIG["kipping_min_frames"]
-                        )
+                    draw_skeleton(frame, lm, chin_pt=(chin_x, chin_y))
+
+            if writer is not None:
+                valid_so_far = sum(1 for r in reps_log if r["valid"])
+                has_active_err = (
+                    state != "WAIT_HANG"
+                    and (
+                        bool(rep_errors)
+                        or knee_bent_frames >= CONFIG["knee_err_min_frames"]
+                        or legs_crossed_frames >= CONFIG["cross_err_min_frames"]
+                        or asym_frames >= CONFIG["asym_min_frames"]
+                        or kipping_frames >= CONFIG["kipping_min_frames"]
                     )
-                    draw_hud(
-                        frame,
-                        valid_reps=valid_so_far,
-                        total_attempts=len(reps_log),
-                        state=state,
-                        hang_sec=last_hang_duration,
-                        elbow_deg=mean_elbow_angle,
-                        knee_deg=mean_knee_angle,
-                        bar_y=bar_y,
-                        chin_above_now=chin_above_now,
-                        active_errors=has_active_err
-                    )
-                    writer.write(frame)
+                )
+                draw_hud(
+                    frame,
+                    valid_reps=valid_so_far,
+                    total_attempts=len(reps_log),
+                    state=state,
+                    hang_sec=last_hang_duration,
+                    elbow_deg=mean_elbow_angle,
+                    knee_deg=mean_knee_angle,
+                    bar_y=bar_y,
+                    chin_above_now=chin_above_now,
+                    active_errors=has_active_err
+                )
+                writer.write(frame)
     finally:
         cap.release()
         if writer is not None:
