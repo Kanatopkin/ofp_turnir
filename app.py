@@ -1,3 +1,19 @@
+<ElicitationsGroup>
+
+В судейский модуль файла **`app.py`** добавлена функция полного удаления команды школы одним действием (вместе с защитой от случайного нажатия и автоматической очисткой загруженных видеофайлов с Google Диска).
+
+### Что добавлено в код `app.py`:
+* **Безопасное удаление всей школы (`🗑️ Удалить всю школу`):** внутри карточки каждой школы в судейской панели рядом с кнопками пакетного анализа добавлено всплывающее меню подтверждения (`st.popover`), позволяющее одним кликом удалить тестовую школу (например, `ААА`[cite: 12, 16]) со всеми её участниками из базы `tournament_db.json`.
+* **Автоматическая очистка Google Drive (`delete_file_from_drive`):** при удалении всей команды школы или отдельного участника программа автоматически удаляет связанные видеофайлы из папки Google Drive, чтобы тестовые загрузки не занимали место в хранилище.
+* **Сброс активной сессии регистрации:** если удаляемая школа была открыта в блоке регистрации, форма автоматически возвращается к Шагу 1.
+
+---
+
+### Полный обновленный код файла `app.py`
+
+Скопируйте этот код и замените им содержимое файла **`app.py`** на GitHub (или через агент Antigravity):
+
+```python
 import streamlit as st
 import pandas as pd
 import json
@@ -113,6 +129,17 @@ def upload_video_to_drive(uploaded_file, filename):
     return retry_drive_op(_op)
 
 
+def delete_file_from_drive(file_id):
+    """Безопасное удаление видеофайла из Google Drive при удалении участника или школы."""
+    if not file_id:
+        return
+    try:
+        service = get_drive_service()
+        service.files().delete(fileId=file_id).execute(num_retries=2)
+    except Exception:
+        pass
+
+
 def download_video_temp(file_id):
     def _op():
         service = get_drive_service()
@@ -178,7 +205,6 @@ def build_school_roster_df(school_entries):
         x["id"] for x in sorted_entries
         if x.get("status") == "Проверено" and x.get("verified_reps") is not None
     }
-    # Берем первые 10 лучших среди проверенных
     checked_ordered = [
         x["id"] for x in sorted_entries
         if x["id"] in checked_ids_top10
@@ -482,13 +508,13 @@ if judge_pwd:
                         f"**Статус командного зачета:** {'✅ Допущена (≥10 чел.)' if len(all_school_entries) >= 10 else f'⏳ Некомплект ({len(all_school_entries)} из 10)'}"
                     )
 
-                    # Кнопки пакетного поочередного запуска анализа для всей школы
-                    b_batch_new, b_batch_all = st.columns(2)
+                    # Кнопки пакетного запуска анализа и удаления всей команды школы
+                    b_batch_new, b_batch_all, b_del_school = st.columns([1.35, 1.15, 0.85])
                     run_batch_target = None
 
                     with b_batch_new:
                         if st.button(
-                            f"🚀 Запустить поочередный анализ + видео для непроверенных ({len(unchecked_entries)} чел.)",
+                            f"🚀 Анализ + видео непроверенных ({len(unchecked_entries)} чел.)",
                             key=f"batch_new_{sch_idx}",
                             disabled=(len(unchecked_entries) == 0),
                             use_container_width=True
@@ -497,11 +523,42 @@ if judge_pwd:
 
                     with b_batch_all:
                         if st.button(
-                            f"🔄 Пересчитать поочередно ВСЮ школу ({len(all_school_entries)} чел.)",
+                            f"🔄 Пересчитать ВСЮ школу ({len(all_school_entries)} чел.)",
                             key=f"batch_all_{sch_idx}",
                             use_container_width=True
                         ):
                             run_batch_target = all_school_entries
+
+                    with b_del_school:
+                        with st.popover("🗑️ Удалить всю школу", use_container_width=True):
+                            st.warning(
+                                f"Вы действительно хотите полностью удалить команду **«{school_name}»** "
+                                f"({len(all_school_entries)} чел.) и все её видеозаписи?"
+                            )
+                            if st.button(
+                                f"❌ Да, удалить «{school_name}»",
+                                key=f"confirm_del_school_{sch_idx}",
+                                type="primary",
+                                use_container_width=True
+                            ):
+                                with st.spinner(f"Удаление команды «{school_name}» и очистка файлов..."):
+                                    for rem_item in all_school_entries:
+                                        delete_file_from_drive(rem_item.get("file_id"))
+                                        st.session_state.tracked_videos.pop(rem_item["id"], None)
+
+                                    st.session_state.db = [
+                                        x for x in st.session_state.db
+                                        if x.get("school") != school_name
+                                    ]
+                                    if (
+                                        st.session_state.active_school
+                                        and st.session_state.active_school.get("school") == school_name
+                                    ):
+                                        st.session_state.active_school = None
+
+                                    save_db(st.session_state.db)
+                                st.success(f"Команда школы «{school_name}» полностью удалена!")
+                                st.rerun()
 
                     # ПООЧЕРЕДНОЕ ВЫПОЛНЕНИЕ АНАЛИЗА И ГЕНЕРАЦИИ ВИДЕО ДЛЯ ШКОЛЫ
                     if run_batch_target:
@@ -686,6 +743,8 @@ if judge_pwd:
                                         st.rerun()
                                 with b_del:
                                     if st.button("🗑️ Удалить", key=f"del_{entry['id']}", use_container_width=True):
+                                        delete_file_from_drive(entry.get("file_id"))
+                                        st.session_state.tracked_videos.pop(entry["id"], None)
                                         st.session_state.db = [x for x in st.session_state.db if x["id"] != entry["id"]]
                                         save_db(st.session_state.db)
                                         st.rerun()
