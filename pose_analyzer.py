@@ -766,12 +766,11 @@ def analyze_video_pose(
             if scale < 1.0:
                 frame = cv2.resize(frame, (out_w, out_h))
 
-            preds = model.predict(frame, conf=0.35, verbose=False)
-            raw_lm, tracked_athlete_center = (
-                select_target_athlete(preds[0], tracked_athlete_center)
-                if preds
-                else (None, tracked_athlete_center)
-            )
+            preds = model.predict(
+    frame, conf=0.35, imgsz=640, verbose=False, device="cpu"
+    if not torch.cuda.is_available()
+    else 0,
+)
 
             mean_elbow_angle = 0.0
             mean_knee_angle = 180.0
