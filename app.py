@@ -280,9 +280,9 @@ st.markdown(
 
 with st.expander("🤖 Гибридная архитектура судейства (YOLOv8-Pose + ИИ-арбитр Gemini) и критерии"):
     st.markdown("""
-    * **Локальное ядро трекинга (YOLOv8-Pose + 1€ Filter):** высокоточное отслеживание ключевых точек (кисти, локти, плечи, подбородок, таз, колени и лодыжки) со стабилизацией скелета.
-    * **Мультимодальный ИИ-арбитр (Gemini 3.5 Flash):** автоматически подключается при любых пограничных и спорных ситуациях (особенно по **высоте подбородка у грифа**, **асимметрии сгибания рук** и **скрещиванию ног**), анализируя раскадровку трех фаз повторения (`1. HANG` $\rightarrow$ `2. MID PULL` $\rightarrow$ `3. PEAK`).
-    * **Отдельный индикатор ИИ-арбитра:** фиксирует каждое срабатывание нейросетевого судьи как на самом видео с трекингом (`AI REFEREE TRIGGERED`), так и в сводных протоколах.
+    * **Локальное ядро трекинга (YOLOv8-Pose + 1€ Filter):** высокоточное отслеживание ключевых точек со стабилизацией скелета и динамической перекалибровкой линии перекладины на каждое подтягивание.
+    * **Мультимодальный ИИ-арбитр (Gemini 3.5 Flash):** автоматически подключается при пограничных ситуациях или принудительно запускается по кнопке **«🧠 Перепроверить всё через ИИ»** для полной независимой экспертизы всех повторений.
+    * **Контроль техники:** проверка чистоты виса (от 1.0 с), пересечения грифа подбородком, отсутствия рывков/махов, синхронности рук и отсутствия скрещивания ног.
     """)
 
 st.divider()
@@ -596,8 +596,9 @@ if judge_pwd:
                                     tmp_path,
                                     manual_bar_y=manual_bar,
                                     generate_tracked_video=True,
+                                    force_ai_all_reps=False,
                                     progress_callback=lambda p, fio=item["fio"], i=idx_p: frame_bar.progress(
-                                        p, text=f"🎥 [{i}/{total_q}] {fio} — трекинг ключевых точек: {int(p*100)}%"
+                                        p, text=f"🎥 [{i}/{total_q}] {fio} — трекинг: {int(p*100)}%"
                                     )
                                 )
                                 if isinstance(res, dict):
@@ -713,9 +714,9 @@ if judge_pwd:
                                         key=f"slider_bar_{entry['id']}"
                                     )
 
-                                b_prev, b_run = st.columns(2)
+                                b_prev, b_run, b_full_ai = st.columns([1, 1, 1.25])
                                 with b_prev:
-                                    if st.button("👁️ Калибровка кадра", key=f"prev_{entry['id']}", use_container_width=True):
+                                    if st.button("👁️ Калибровка", key=f"prev_{entry['id']}", use_container_width=True):
                                         with st.spinner("Загрузка кадра и поиск кистей..."):
                                             tmp_path = download_video_temp(entry["file_id"])
                                             try:
@@ -727,15 +728,16 @@ if judge_pwd:
                                                     os.remove(tmp_path)
 
                                 with b_run:
-                                    if st.button("🤖 Анализ + Видео (индив.)", key=f"pose_{entry['id']}", use_container_width=True):
-                                        prog_bar = st.progress(0.0, text="Покадровая обработка и запись видео со скелетом...")
+                                    if st.button("🤖 Анализ (YOLO)", key=f"pose_{entry['id']}", use_container_width=True):
+                                        prog_bar = st.progress(0.0, text="Покадровая обработка и запись видео...")
                                         tmp_path = download_video_temp(entry["file_id"])
                                         try:
                                             res = analyze_video_pose(
                                                 tmp_path,
                                                 manual_bar_y=manual_bar_val,
                                                 generate_tracked_video=True,
-                                                progress_callback=lambda p: prog_bar.progress(p, text=f"Трекинг ключевых точек: {int(p*100)}%")
+                                                force_ai_all_reps=False,
+                                                progress_callback=lambda p: prog_bar.progress(p, text=f"Трекинг: {int(p*100)}%")
                                             )
                                             prog_bar.empty()
 
@@ -759,7 +761,47 @@ if judge_pwd:
                                                 save_db(st.session_state.db)
                                                 st.rerun()
                                         except Exception as e:
-                                            st.error(f"Ошибка при выполнении анализа видео: {type(e).__name__}: {e}")
+                                            st.error(f"Ошибка при анализе: {e}")
+                                        finally:
+                                            if os.path.exists(tmp_path):
+                                                os.remove(tmp_path)
+
+                                with b_full_ai:
+                                    if st.button("🧠 Перепроверить всё через ИИ", key=f"ai_full_{entry['id']}", use_container_width=True):
+                                        prog_bar = st.progress(0.0, text="Полный аудит: экспертиза КАЖДОГО повторения через Gemini 3.5 Flash...")
+                                        tmp_path = download_video_temp(entry["file_id"])
+                                        try:
+                                            res = analyze_video_pose(
+                                                tmp_path,
+                                                manual_bar_y=manual_bar_val,
+                                                generate_tracked_video=True,
+                                                force_ai_all_reps=True,
+                                                progress_callback=lambda p: prog_bar.progress(p, text=f"Экспертиза ИИ-арбитра: {int(p*100)}%")
+                                            )
+                                            prog_bar.empty()
+
+                                            if isinstance(res, dict):
+                                                entry["verified_reps"] = res.get("valid_reps", 0)
+                                                entry["bar_y"] = res.get("bar_y", 0.12)
+                                                entry["errors"] = res.get("errors", [])
+                                                entry["reps_detail"] = res.get("reps_detail", [])
+                                                entry["ai_referee_calls"] = res.get("ai_referee_calls", 0)
+                                                entry["ai_referee_triggered"] = res.get("ai_referee_triggered", False)
+                                                entry["ai_verified_reps"] = res.get("ai_verified_reps", [])
+                                                entry["comment"] = res.get("comment", "")
+                                                entry["status"] = "Проверено"
+
+                                                tracked_path = res.get("tracked_video_path")
+                                                if tracked_path and os.path.exists(tracked_path):
+                                                    with open(tracked_path, "rb") as vf:
+                                                        st.session_state.tracked_videos[entry["id"]] = vf.read()
+                                                    os.remove(tracked_path)
+
+                                                save_db(st.session_state.db)
+                                                st.success("Полная экспертиза через ИИ-арбитра завершена!")
+                                                st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Ошибка при работе ИИ-арбитра: {e}")
                                         finally:
                                             if os.path.exists(tmp_path):
                                                 os.remove(tmp_path)
