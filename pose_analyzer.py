@@ -31,7 +31,7 @@ _MODEL_INSTANCE = None
 # =====================================================================
 CONFIG = {
     # 1. Фиксация ИП перед стартом (с)
-    "min_hang_sec": 0.85,
+    "min_hang_sec": 0.55,
     # 2. Угол локтей в нижнем висе (градусы)
     "elbow_ext_angle": 166.0,
     # 3. Максимальное время нахождения на полусогнутых руках (148..166 град) перед стартом тяги (с)
@@ -915,6 +915,7 @@ def analyze_video_pose(
     elbow_ext_angle=CONFIG["elbow_ext_angle"],
     min_hang_sec=CONFIG["min_hang_sec"],
     generate_tracked_video=True,
+    force_ai_all_reps=False,
     progress_callback=None
 ):
     result = {
