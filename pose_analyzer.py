@@ -93,17 +93,18 @@ CONFIG = {
     "asym_min_frames": 4,
     # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
     "bar_release_dist": 0.16,
-    # --- ПАРАМЕТРЫ СТАБИЛИЗАЦИИ СКЕЛЕТА ---
+    # --- ПАРАМЕТРЫ СТАБИЛИЗАЦИИ СКЕЛЕТА (1€ FILTER + ЗАЩИТА ОТ СХЛОПЫВАНИЯ) ---
     "filter_min_cutoff_x": 0.65,
     "filter_beta_x": 0.04,
     "filter_min_cutoff_y": 1.35,
     "filter_beta_y": 0.35,
     "skeleton_collapse_ratio": 0.68,
     "max_joint_jump_per_frame": 0.085,
-    # --- ПАРАМЕТРЫ УЧАЩЕННОЙ ВЕРИФИКАЦИИ ЧЕРЕЗ GEMINI API ---
+    # --- ПАРАМЕТРЫ УЧАЩЕННОЙ ВЕРИФИКАЦИИ ЧЕРЕЗ GEMINI API И ИНДИКАТОРА ---
     "enable_gemini_verifier": True,
-    "dispute_chin_margin": 0.050,       # Расширенная зона сомнения по подбородку (±5% высоты кадра)
-    "dispute_frame_margin": 6,          # Увеличенный запас кадров для частого вызова ИИ-арбитра
+    "dispute_chin_margin": 0.050,       # Расширенная зона сомнения по высоте подбородка у грифа (±5% высоты кадра)
+    "dispute_frame_margin": 6,          # Запас кадров вокруг порога ошибки для вызова ИИ-арбитра
+    "ai_banner_display_sec": 3.0,       # Длительность свечения баннера ИИ-арбитра на видео после попытки (с)
 }
 
 
@@ -145,6 +146,7 @@ POSE_CONNECTIONS = [
 
 
 class StabilizedLandmark:
+    """Унифицированный контейнер ключевой точки."""
     __slots__ = ("x", "y", "z", "visibility", "presence")
 
     def __init__(self, x, y, z=0.0, visibility=1.0, presence=1.0):
@@ -156,6 +158,7 @@ class StabilizedLandmark:
 
 
 def _resolve_gemini_api_key():
+    """Ищет ключ GEMINI_API_KEY в переменных окружения или в Streamlit Secrets."""
     key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if key:
         return key
@@ -173,7 +176,10 @@ def _resolve_gemini_api_key():
 
 
 class GeminiDisputeVerifier:
-    """Усовершенствованный ИИ-арбитр с частыми обращениями по подбородку, асимметрии рук и ногам."""
+    """
+    Верифицирующий модуль (ИИ-арбитр) на базе Gemini 3.5 Flash для проверки спорных попыток
+    с повышенным вниманием к подбородку, асимметрии рук и скрещиванию ног.
+    """
 
     def __init__(self, enabled=True):
         self.api_key = _resolve_gemini_api_key()
@@ -190,7 +196,7 @@ class GeminiDisputeVerifier:
                 self.enabled = False
 
     @staticmethod
-    def is_rep_disputed(
+    def get_dispute_reasons(
         rep_errors,
         min_chin_y,
         bar_y,
@@ -204,29 +210,41 @@ class GeminiDisputeVerifier:
         kip_frames,
         kip_thresh,
     ):
-        """Расширенные условия для частого вызова ИИ-арбитра (подбородок, асимметрия рук, скрещивание ног)."""
-        # 1. Всегда отправляем к ИИ при любом сомнении по подбородку около грифа
-        if abs(min_chin_y - bar_y) <= CONFIG["dispute_chin_margin"] or "подбородок ниже уровня грифа перекладины" in rep_errors:
-            return True
+        """Возвращает список причин, по которым попытка требует вмешательства ИИ-арбитра."""
+        reasons = []
+        margin = CONFIG["dispute_frame_margin"]
 
-        # 2. Учащенный вызов при асимметрии рук (даже при малом числе кадров отклонения)
-        if asym_frames >= 1 or abs(asym_frames - asym_thresh) <= CONFIG["dispute_frame_margin"]:
-            return True
+        # 1. Контроль подбородка
+        if (
+            abs(min_chin_y - bar_y) <= CONFIG["dispute_chin_margin"]
+            or "подбородок ниже уровня грифа перекладины" in rep_errors
+            or (min_elbow_deg <= 68.0 and min_elbow_deg > 28.0)
+        ):
+            reasons.append("CHIN")
 
-        # 3. Учащенный вызов при перекрещивании ног или согнутых коленях
-        if cross_frames >= 1 or abs(cross_frames - cross_thresh) <= CONFIG["dispute_frame_margin"]:
-            return True
-        if knee_frames >= 2 or abs(knee_frames - knee_thresh) <= CONFIG["dispute_frame_margin"]:
-            return True
+        # 2. Контроль асимметрии рук
+        if asym_frames >= 1 or abs(asym_frames - asym_thresh) <= margin:
+            reasons.append("ASYM_ARMS")
 
-        # 4. Общий контроль рывков
-        if kip_frames >= 2 or abs(kip_frames - kip_thresh) <= CONFIG["dispute_frame_margin"]:
-            return True
+        # 3. Контроль скрещивания ног
+        if cross_frames >= 1 or abs(cross_frames - cross_thresh) <= margin:
+            reasons.append("CROSS_LEGS")
 
-        return False
+        # 4. Контроль коленей и махов
+        if knee_frames >= 2 or abs(knee_frames - knee_thresh) <= margin:
+            reasons.append("KNEES")
+        if kip_frames >= 2 or abs(kip_frames - kip_thresh) <= margin:
+            reasons.append("KIPPING")
+
+        return reasons
+
+    @classmethod
+    def is_rep_disputed(cls, **kwargs):
+        return len(cls.get_dispute_reasons(**kwargs)) > 0
 
     @staticmethod
     def build_storyboard_jpeg(start_frame, mid_frame, peak_frame, bar_y):
+        """Склеивает 3 ключевых кадра (ИП, Середина тяги, Пик) в одно изображение с разметкой линии грифа."""
         frames = [f for f in (start_frame, mid_frame, peak_frame) if f is not None]
         if not frames:
             return None
@@ -255,6 +273,10 @@ class GeminiDisputeVerifier:
         return buf.tobytes() if ok else None
 
     def verify_repetition(self, start_frame, mid_frame, peak_frame, bar_y, fsm_errors, min_elbow_deg):
+        """
+        Отправляет раскадровку спорной попытки в Gemini 3.5 Flash и возвращает:
+        (скорректированный набор ошибок, краткий вердикт ИИ-арбитра).
+        """
         if not self.enabled:
             return set(fsm_errors), None
 
@@ -263,19 +285,23 @@ class GeminiDisputeVerifier:
             return set(fsm_errors), None
 
         prompt = (
-            "Ты — главный судья соревнований по подтягиваниям на высокой перекладине.\n"
-            "Внимательно проанализируй 3 кадра попытки (1. Старт виса, 2. Середина подъема, 3. Пик сверху).\n"
-            "Желтая линия — уровень перекладины.\n"
-            f"Локальные датчики зафиксировали: {list(fsm_errors) if fsm_errors else ['Нет ошибок']}.\n\n"
-            "Вынеси экспертный вердикт по 5 критериям:\n"
-            "1. chin_above_bar: Подбородок (нижняя челюсть атлета) четко поднялся ВЫШЕ желтой линии грифа на кадре 3?\n"
-            "2. knees_straight: Ноги абсолютно прямые, колени не согнуты, голени не запрокинуты назад?\n"
-            "3. legs_uncrossed: Ноги и стопы не перекрещены между собой?\n"
-            "4. no_kipping: Подтягивание чистое, без рывков тазом и махов ногами?\n"
-            "5. arms_symmetric: Руки сгибаются синхронно, без перекосов и поочередного вытягивания?\n\n"
-            "Верни ТОЛЬКО JSON-объект:\n"
+            "Ты — главный судья соревнований ГТО/ОФП по подтягиваниям из виса на высокой перекладине.\n"
+            "На изображении показаны 3 фазы одной спорной попытки: "
+            "1. HANG (исходное положение виса), 2. MID PULL (середина тяги), 3. PEAK (верхняя точка).\n"
+            "Желтая горизонтальная линия — уровень грифа перекладины.\n"
+            f"Предварительные замечания локального датчика: {list(fsm_errors) if fsm_errors else ['Нет ошибок']} "
+            f"(минимальный угол локтей в пике: {min_elbow_deg:.0f} град).\n\n"
+            "Особое внимание удели 3 главным триггерам: ПОДБОРОДОК, АСИММЕТРИЯ РУК и СКРЕЩИВАНИЕ НОГ.\n"
+            "Проверь строго по визуальным данным:\n"
+            "1. chin_above_bar: Пересек ли подбородок (нижняя челюсть) уровень грифа перекладины на кадре 3 (PEAK)? "
+            "(Если лицо только уперлось в гриф спереди или подбородок ниже перекладины — false).\n"
+            "2. knees_straight: Прямые ли ноги в коленях на всех 3 кадрах? (Если голени захлестнуты назад или колени подтянуты — false).\n"
+            "3. legs_uncrossed: Не перекрещены ли голени или лодыжки между собой (нет ли наложения стоп внахлест)?\n"
+            "4. no_kipping: Выполнено ли подтягивание ровно, без маха ногами, рывка тазом и сильного раскачивания корпуса?\n"
+            "5. arms_symmetric: Сгибаются ли руки равномерно без перекоса плеч/локтей и поочередного вытягивания одной рукой?\n\n"
+            "Верни ТОЛЬКО валидный JSON по следующей схеме:\n"
             '{"chin_above_bar": bool, "knees_straight": bool, "legs_uncrossed": bool, '
-            '"no_kipping": bool, "arms_symmetric": bool, "short_reason": "краткий комментарий арбитра до 8 слов"}'
+            '"no_kipping": bool, "arms_symmetric": bool, "short_reason": "краткий вывод до 8 слов"}'
         )
 
         try:
@@ -309,7 +335,7 @@ class GeminiDisputeVerifier:
 
             if not verdict.get("chin_above_bar", True):
                 updated_errors.add("подбородок ниже уровня грифа перекладины")
-            elif "подбородок ниже уровня грифа перекладины" in updated_errors and min_elbow_deg <= 48.0:
+            elif "подбородок ниже уровня грифа перекладины" in updated_errors and min_elbow_deg <= 55.0:
                 updated_errors.discard("подбородок ниже уровня грифа перекладины")
 
             if not verdict.get("knees_straight", True):
@@ -339,6 +365,7 @@ class GeminiDisputeVerifier:
 
 
 def get_yolo_model():
+    """Ленивая загрузка модели YOLOv8-Pose."""
     global _MODEL_INSTANCE
     if _MODEL_INSTANCE is None:
         _MODEL_INSTANCE = YOLO(YOLO_MODEL_NAME)
@@ -346,6 +373,7 @@ def get_yolo_model():
 
 
 def select_target_athlete(yolo_result, prev_center=None):
+    """Выбирает целевого спортсмена на турнике из всех обнаруженных людей в кадре."""
     if (
         yolo_result is None
         or yolo_result.keypoints is None
@@ -425,6 +453,8 @@ def select_target_athlete(yolo_result, prev_center=None):
 
 
 class OneEuroFilter:
+    """Адаптивный фильтр низких частот 1€ (One Euro Filter)."""
+
     def __init__(self, min_cutoff=1.0, beta=0.05, d_cutoff=1.0):
         self.min_cutoff = float(min_cutoff)
         self.beta = float(beta)
@@ -467,6 +497,8 @@ class OneEuroFilter:
 
 
 class SkeletonStabilizer:
+    """Стабилизатор скелета с анатомической защитой от схлопывания и 1€-фильтрацией."""
+
     HAND_INDICES = {LM.LEFT_WRIST, LM.RIGHT_WRIST}
 
     def __init__(self, config=CONFIG):
@@ -722,7 +754,24 @@ def draw_skeleton(frame, landmarks, chin_pt=None):
         cv2.putText(frame, "CHIN", (ch_x + 10, ch_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2, cv2.LINE_AA)
 
 
-def draw_hud(frame, valid_reps, total_attempts, state, hang_sec, elbow_deg, knee_deg, bar_y, chin_above_now, active_errors):
+def draw_hud(
+    frame,
+    valid_reps,
+    total_attempts,
+    state,
+    hang_sec,
+    elbow_deg,
+    knee_deg,
+    bar_y,
+    chin_above_now,
+    active_errors,
+    ai_calls_count=0,
+    ai_dispute_live=False,
+    ai_banner_active=False,
+    ai_last_rep_num=None,
+    ai_last_valid=None,
+):
+    """Отрисовка HUD-панели и отдельного визуального индикатора срабатывания ИИ-арбитра."""
     h, w, _ = frame.shape
     if bar_y is not None:
         bar_px = int(bar_y * h)
@@ -733,18 +782,68 @@ def draw_hud(frame, valid_reps, total_attempts, state, hang_sec, elbow_deg, knee
         cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
         cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2)
 
+    # 1. ОТДЕЛЬНЫЙ ВЕРХНИЙ ИНДИКАТОР-БАННЕР ПРИ СРАБАТЫВАНИИ ИИ-АРБИТРА
+    if ai_banner_active and ai_last_rep_num is not None:
+        banner_overlay = frame.copy()
+        bw, bh = min(w - 20, 390), 58
+        bx1 = max(10, w - bw - 12)
+        by1 = 12
+        bg_color = (25, 95, 25) if ai_last_valid else (45, 20, 110)
+        border_color = (0, 255, 120) if ai_last_valid else (255, 80, 255)
+
+        cv2.rectangle(banner_overlay, (bx1, by1), (bx1 + bw, by1 + bh), bg_color, -1)
+        cv2.addWeighted(banner_overlay, 0.82, frame, 0.18, 0, frame)
+        cv2.rectangle(frame, (bx1, by1), (bx1 + bw, by1 + bh), border_color, 2)
+
+        verdict_tag = "VALID (OK)" if ai_last_valid else "REJECTED (ERR)"
+        cv2.putText(
+            frame,
+            f"AI REFEREE TRIGGERED [REP #{ai_last_rep_num}]",
+            (bx1 + 12, by1 + 23),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.54,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"VERDICT: {verdict_tag} | TOTAL CALLS: {ai_calls_count}",
+            (bx1 + 12, by1 + 47),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    # 2. ОСНОВНАЯ ПАНЕЛЬ HUD ВНИЗУ С ПОСТОЯННЫМ ИНДИКАТОРОМ ИИ-АРБИТРА
     overlay = frame.copy()
-    box_w, box_h = min(w - 20, 440), 130
+    box_w, box_h = min(w - 20, 460), 158
     y_top = max(10, h - box_h - 15)
     cv2.rectangle(overlay, (10, y_top), (10 + box_w, y_top + box_h), (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.68, frame, 0.32, 0, frame)
 
-    cv2.putText(frame, f"VALID REPS: {valid_reps} / ATTEMPTS: {total_attempts}", (20, y_top + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (0, 255, 120), 2)
-    cv2.putText(frame, f"STATE: {state} | HANG: {hang_sec:.2f}s", (20, y_top + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 2)
-    cv2.putText(frame, f"ELBOW: {int(elbow_deg)} deg | KNEE: {int(knee_deg)} deg", (20, y_top + 86), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (200, 230, 255), 2)
+    cv2.putText(frame, f"VALID REPS: {valid_reps} / ATTEMPTS: {total_attempts}", (20, y_top + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (0, 255, 120), 2)
+    cv2.putText(frame, f"STATE: {state} | HANG: {hang_sec:.2f}s", (20, y_top + 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    cv2.putText(frame, f"ELBOW: {int(elbow_deg)} deg | KNEE: {int(knee_deg)} deg", (20, y_top + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 230, 255), 2)
+
     err_status = "ERRORS IN REP: YES" if active_errors else "TECHNIQUE: OK"
     err_color = (0, 80, 255) if active_errors else (0, 255, 0)
-    cv2.putText(frame, err_status, (20, y_top + 114), cv2.FONT_HERSHEY_SIMPLEX, 0.56, err_color, 2)
+    cv2.putText(frame, err_status, (20, y_top + 110), cv2.FONT_HERSHEY_SIMPLEX, 0.55, err_color, 2)
+
+    # Строка 5: Индикатор состояния ИИ-арбитра
+    if ai_banner_active and ai_last_rep_num is not None:
+        ai_text = f"AI REFEREE: TRIGGERED ON REP #{ai_last_rep_num} (CALLS: {ai_calls_count})"
+        ai_color = (255, 120, 255)
+    elif ai_dispute_live:
+        ai_text = f"AI REFEREE: DISPUTE ARMED (CALLS: {ai_calls_count})"
+        ai_color = (0, 215, 255)
+    else:
+        ai_text = f"AI REFEREE: STANDBY | CALLS: {ai_calls_count}"
+        ai_color = (180, 180, 180) if ai_calls_count == 0 else (255, 200, 100)
+
+    cv2.putText(frame, ai_text, (20, y_top + 140), cv2.FONT_HERSHEY_SIMPLEX, 0.52, ai_color, 2, cv2.LINE_AA)
 
 
 def get_calibration_preview(video_path, manual_bar_y=None):
@@ -805,7 +904,10 @@ def analyze_video_pose(
         "errors": [],
         "reps_detail": [],
         "comment": "Повторения не зафиксированы.",
-        "tracked_video_path": None
+        "tracked_video_path": None,
+        "ai_referee_calls": 0,
+        "ai_referee_triggered": False,
+        "ai_verified_reps": []
     }
 
     cap = cv2.VideoCapture(video_path)
@@ -817,6 +919,11 @@ def analyze_video_pose(
     raw_out_path = None
     reps_log = []
     bar_y = manual_bar_y if manual_bar_y is not None else 0.12
+
+    ai_calls_count = 0
+    ai_last_trigger_time = -999.0
+    ai_last_rep_num = None
+    ai_last_valid = None
 
     try:
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -1163,6 +1270,9 @@ def analyze_video_pose(
                                 "timestamp": f"{format_timestamp(rep_start_time)} – {format_timestamp(current_time)}",
                                 "valid": False,
                                 "status_text": "❌ Не засчитано",
+                                "ai_triggered": False,
+                                "ai_indicator": "⚪ Не требовался",
+                                "ai_verdict": "—",
                                 "errors": sorted(rep_errors)
                             })
                         state = "WAIT_HANG"
@@ -1239,9 +1349,9 @@ def analyze_video_pose(
                                 ):
                                     rep_errors.add("подбородок ниже уровня грифа перекладины")
 
-                                # --- УСОВЕРШЕНСТВОВАННАЯ ВЕРИФИКАЦИЯ ЧЕРЕЗ GEMINI 3.5 FLASH ---
+                                # --- ВЕРИФИКАЦИЯ СПОРНЫХ ПОПЫТОК И АКТИВАЦИЯ ИНДИКАТОРА ИИ-АРБИТРА ---
                                 ai_referee_note = None
-                                if verifier.enabled and verifier.is_rep_disputed(
+                                dispute_reasons = verifier.get_dispute_reasons(
                                     rep_errors=rep_errors,
                                     min_chin_y=min_chin_y_in_rep,
                                     bar_y=bar_y,
@@ -1254,7 +1364,9 @@ def analyze_video_pose(
                                     cross_thresh=cross_thresh,
                                     kip_frames=kipping_frames,
                                     kip_thresh=kip_thresh,
-                                ):
+                                )
+
+                                if verifier.enabled and len(dispute_reasons) > 0:
                                     rep_errors, ai_referee_note = verifier.verify_repetition(
                                         start_frame=rep_start_frame,
                                         mid_frame=rep_mid_frame,
@@ -1265,15 +1377,27 @@ def analyze_video_pose(
                                     )
 
                                 is_valid = len(rep_errors) == 0
+                                current_rep_num = len(reps_log) + 1
+                                ai_was_triggered = ai_referee_note is not None
+
+                                if ai_was_triggered:
+                                    ai_calls_count += 1
+                                    ai_last_trigger_time = current_time
+                                    ai_last_rep_num = current_rep_num
+                                    ai_last_valid = is_valid
+
                                 status_str = "✅ Засчитано" if is_valid else "❌ Не засчитано"
-                                if ai_referee_note:
+                                if ai_was_triggered:
                                     status_str += " (🤖 ИИ-арбитр)"
 
                                 reps_log.append({
-                                    "rep_number": len(reps_log) + 1,
+                                    "rep_number": current_rep_num,
                                     "timestamp": f"{format_timestamp(rep_start_time)} – {format_timestamp(current_time)}",
                                     "valid": is_valid,
                                     "status_text": status_str,
+                                    "ai_triggered": ai_was_triggered,
+                                    "ai_indicator": f"🤖 Сработал ({', '.join(dispute_reasons)})" if ai_was_triggered else "⚪ Локально (YOLO)",
+                                    "ai_verdict": ai_referee_note if ai_was_triggered else "—",
                                     "errors": sorted(rep_errors) if rep_errors else ["Нет ошибок"]
                                 })
 
@@ -1300,6 +1424,17 @@ def analyze_video_pose(
                         or kipping_frames >= CONFIG["kipping_min_frames"]
                     )
                 )
+                ai_dispute_live = (
+                    state != "WAIT_HANG"
+                    and (
+                        asym_frames >= 1
+                        or legs_crossed_frames >= 1
+                        or knee_bent_frames >= 2
+                        or abs(min_chin_y_in_rep - bar_y) <= CONFIG["dispute_chin_margin"]
+                    )
+                )
+                ai_banner_active = (current_time - ai_last_trigger_time) <= CONFIG["ai_banner_display_sec"]
+
                 draw_hud(
                     frame,
                     valid_reps=valid_so_far,
@@ -1310,7 +1445,12 @@ def analyze_video_pose(
                     knee_deg=mean_knee_angle,
                     bar_y=bar_y,
                     chin_above_now=chin_above_now,
-                    active_errors=has_active_err
+                    active_errors=has_active_err,
+                    ai_calls_count=ai_calls_count,
+                    ai_dispute_live=ai_dispute_live,
+                    ai_banner_active=ai_banner_active,
+                    ai_last_rep_num=ai_last_rep_num,
+                    ai_last_valid=ai_last_valid,
                 )
                 writer.write(frame)
     finally:
@@ -1324,8 +1464,12 @@ def analyze_video_pose(
 
     valid_count = sum(1 for r in reps_log if r["valid"])
     all_unique_errors = sorted({err for r in reps_log if not r["valid"] for err in r["errors"]})
+    ai_verified_list = [r["rep_number"] for r in reps_log if r.get("ai_triggered")]
+
     summary_lines = [
-        f"Повторение #{r['rep_number']} [{r['timestamp']}]: {r['status_text']} ({', '.join(r['errors'])})"
+        f"Повторение #{r['rep_number']} [{r['timestamp']}]: {r['status_text']} "
+        f"| ИИ-арбитр: {r.get('ai_indicator', '—')} "
+        f"({', '.join(r['errors'])})"
         for r in reps_log
     ]
 
@@ -1336,4 +1480,7 @@ def analyze_video_pose(
     result["reps_detail"] = reps_log
     result["comment"] = "\n".join(summary_lines) if summary_lines else "Повторения не зафиксированы."
     result["tracked_video_path"] = final_video_path
+    result["ai_referee_calls"] = ai_calls_count
+    result["ai_referee_triggered"] = ai_calls_count > 0
+    result["ai_verified_reps"] = ai_verified_list
     return result
