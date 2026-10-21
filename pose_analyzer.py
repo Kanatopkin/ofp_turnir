@@ -93,6 +93,10 @@ CONFIG = {
     "asym_min_frames": 4,
     # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
     "bar_release_dist": 0.16,
+    # --- ПАРАМЕТРЫ ДИНАМИЧЕСКОГО ОБНОВЛЕНИЯ ЛИНИИ ПЕРЕКЛАДИНЫ НА КАЖДОЕ ПОДТЯГИВАНИЕ ---
+    "bar_hang_window_frames": 15,       # Окно калибровки грифа перед началом каждого нового подтягивания
+    "bar_rep_window_frames": 20,        # Окно адаптивного уточнения грифа внутри текущего подтягивания
+    "bar_max_Rep_drift": 0.045,         # Максимально допустимое смещение грифа за кадр внутри попытки (отсев выбросов)
     # --- ПАРАМЕТРЫ СТАБИЛИЗАЦИИ СКЕЛЕТА (1€ FILTER + ЗАЩИТА ОТ СХЛОПЫВАНИЯ) ---
     "filter_min_cutoff_x": 0.65,
     "filter_beta_x": 0.04,
@@ -214,7 +218,7 @@ class GeminiDisputeVerifier:
         reasons = []
         margin = CONFIG["dispute_frame_margin"]
 
-        # 1. Контроль подбородка
+        # 1. Контроль подбородка относительно обновленной линии перекладины
         if (
             abs(min_chin_y - bar_y) <= CONFIG["dispute_chin_margin"]
             or "подбородок ниже уровня грифа перекладины" in rep_errors
@@ -285,21 +289,35 @@ class GeminiDisputeVerifier:
             return set(fsm_errors), None
 
         prompt = (
-            "Ты — главный судья соревнований ГТО/ОФП по подтягиваниям из виса на высокой перекладине.\n"
+            "Ты — главный судья соревнований ГТО/ОФП по подтягиваниям из виса на высокой перекладине.
+"
             "На изображении показаны 3 фазы одной спорной попытки: "
-            "1. HANG (исходное положение виса), 2. MID PULL (середина тяги), 3. PEAK (верхняя точка).\n"
-            "Желтая горизонтальная линия — уровень грифа перекладины.\n"
+            "1. HANG (исходное положение виса), 2. MID PULL (середина тяги), 3. PEAK (верхняя точка).
+"
+            "Желтая горизонтальная линия — индивидуально откалиброванный уровень грифа перекладины для этого повторения.
+"
             f"Предварительные замечания локального датчика: {list(fsm_errors) if fsm_errors else ['Нет ошибок']} "
-            f"(минимальный угол локтей в пике: {min_elbow_deg:.0f} град).\n\n"
-            "Особое внимание удели 3 главным триггерам: ПОДБОРОДОК, АСИММЕТРИЯ РУК и СКРЕЩИВАНИЕ НОГ.\n"
-            "Проверь строго по визуальным данным:\n"
+            f"(минимальный угол локтей в пике: {min_elbow_deg:.0f} град).
+
+"
+            "Особое внимание удели 3 главным триггерам: ПОДБОРОДОК, АСИММЕТРИЯ РУК и СКРЕЩИВАНИЕ НОГ.
+"
+            "Проверь строго по визуальным данным:
+"
             "1. chin_above_bar: Пересек ли подбородок (нижняя челюсть) уровень грифа перекладины на кадре 3 (PEAK)? "
-            "(Если лицо только уперлось в гриф спереди или подбородок ниже перекладины — false).\n"
-            "2. knees_straight: Прямые ли ноги в коленях на всех 3 кадрах? (Если голени захлестнуты назад или колени подтянуты — false).\n"
-            "3. legs_uncrossed: Не перекрещены ли голени или лодыжки между собой (нет ли наложения стоп внахлест)?\n"
-            "4. no_kipping: Выполнено ли подтягивание ровно, без маха ногами, рывка тазом и сильного раскачивания корпуса?\n"
-            "5. arms_symmetric: Сгибаются ли руки равномерно без перекоса плеч/локтей и поочередного вытягивания одной рукой?\n\n"
-            "Верни ТОЛЬКО валидный JSON по следующей схеме:\n"
+            "(Если лицо только уперлось в гриф спереди или подбородок ниже перекладины — false).
+"
+            "2. knees_straight: Прямые ли ноги в коленях на всех 3 кадрах? (Если голени захлестнуты назад или колени подтянуты — false).
+"
+            "3. legs_uncrossed: Не перекрещены ли голени или лодыжки между собой (нет ли наложения стоп внахлест)?
+"
+            "4. no_kipping: Выполнено ли подтягивание ровно, без маха ногами, рывка тазом и сильного раскачивания корпуса?
+"
+            "5. arms_symmetric: Сгибаются ли руки равномерно без перекоса плеч/локтей и поочередного вытягивания одной рукой?
+
+"
+            "Верни ТОЛЬКО валидный JSON по следующей схеме:
+"
             '{"chin_above_bar": bool, "knees_straight": bool, "legs_uncrossed": bool, '
             '"no_kipping": bool, "arms_symmetric": bool, "short_reason": "краткий вывод до 8 слов"}'
         )
@@ -707,9 +725,23 @@ def format_timestamp(seconds):
     return f"{mins:02d}:{secs:04.1f}"
 
 
-def compute_bar_y_from_hands(lm):
-    wrist_y = 0.5 * (lm[LM.LEFT_WRIST].y + lm[LM.RIGHT_WRIST].y)
-    sh_w = max(0.08, abs(lm[LM.LEFT_SHOULDER].x - lm[LM.RIGHT_SHOULDER].x))
+def compute_bar_y_from_hands(lm, ref_sh_w=None):
+    """
+    Вычисляет положение оси перекладины по костяшкам/запястьям с опорой на эталонную ширину плеч,
+    чтобы поворот плеч во время тяги не искажал высоту грифа.
+    """
+    l_wr, r_wr = lm[LM.LEFT_WRIST], lm[LM.RIGHT_WRIST]
+    if l_wr.visibility >= 0.35 and r_wr.visibility >= 0.35:
+        wrist_y = 0.5 * (l_wr.y + r_wr.y)
+    elif l_wr.visibility > r_wr.visibility:
+        wrist_y = l_wr.y
+    else:
+        wrist_y = r_wr.y
+
+    if ref_sh_w is not None and ref_sh_w > 0.06:
+        sh_w = ref_sh_w
+    else:
+        sh_w = max(0.08, abs(lm[LM.LEFT_SHOULDER].x - lm[LM.RIGHT_SHOULDER].x))
     return float(max(0.02, wrist_y - 0.18 * sh_w))
 
 
@@ -765,22 +797,24 @@ def draw_hud(
     bar_y,
     chin_above_now,
     active_errors,
+    current_rep_idx=1,
     ai_calls_count=0,
     ai_dispute_live=False,
     ai_banner_active=False,
     ai_last_rep_num=None,
     ai_last_valid=None,
 ):
-    """Отрисовка HUD-панели и отдельного визуального индикатора срабатывания ИИ-арбитра."""
+    """Отрисовка HUD-панели, динамической линии перекладины для каждого повторения и индикатора ИИ-арбитра."""
     h, w, _ = frame.shape
     if bar_y is not None:
         bar_px = int(bar_y * h)
         bar_color = (0, 255, 0) if chin_above_now else (0, 215, 255)
         cv2.line(frame, (0, bar_px), (w, bar_px), bar_color, 3)
         label_y = bar_px + 22 if bar_px < 35 else bar_px - 8
-        label_text = f"BAR LINE (Y={bar_y:.2f}) {'[CHIN ABOVE]' if chin_above_now else ''}"
-        cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-        cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bar_color, 2)
+        rep_tag = f"REP #{current_rep_idx}" if state != "WAIT_HANG" else f"NEXT REP #{current_rep_idx}"
+        label_text = f"BAR LINE [{rep_tag}: Y={bar_y:.3f}] {'[CHIN ABOVE]' if chin_above_now else ''}"
+        cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 4)
+        cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, bar_color, 2)
 
     # 1. ОТДЕЛЬНЫЙ ВЕРХНИЙ ИНДИКАТОР-БАННЕР ПРИ СРАБАТЫВАНИИ ИИ-АРБИТРА
     if ai_banner_active and ai_last_rep_num is not None:
@@ -949,7 +983,11 @@ def analyze_video_pose(
         last_hang_duration = 0.0
         pre_bend_frames = 0
 
-        bar_y_samples = []
+        # Буферы для индивидуального обновления линии перекладины на КАЖДОЕ подтягивание
+        hang_bar_samples = deque(maxlen=CONFIG["bar_hang_window_frames"])
+        rep_bar_samples = deque(maxlen=CONFIG["bar_rep_window_frames"])
+        rep_bar_anchor_y = bar_y
+
         shoulder_w_samples = []
         base_sh_tilt_samples = []
         base_el_tilt_samples = []
@@ -1033,10 +1071,7 @@ def analyze_video_pose(
             chin_above_now = False
 
             if raw_lm is not None:
-                if manual_bar_y is None and len(bar_y_samples) < 60:
-                    bar_y_samples.append(compute_bar_y_from_hands(raw_lm))
-                    bar_y = float(np.median(bar_y_samples))
-
+                # Стабилизируем скелет
                 lm = stabilizer.process(raw_lm, current_time, bar_y=bar_y)
 
                 def pt(idx):
@@ -1049,6 +1084,18 @@ def analyze_video_pose(
                 l_kn, r_kn = pt(LM.LEFT_KNEE), pt(LM.RIGHT_KNEE)
                 l_an, r_an = pt(LM.LEFT_ANKLE), pt(LM.RIGHT_ANKLE)
 
+                wrist_y = (l_wr[1] + r_wr[1]) / 2.0
+                wrists_conf_ok = (lm[LM.LEFT_WRIST].visibility >= 0.30 or lm[LM.RIGHT_WRIST].visibility >= 0.30)
+
+                # --- ДИНАМИЧЕСКОЕ ВЫЧИСЛЕНИЕ ПОЛОЖЕНИЯ ПЕРЕКЛАДИНЫ В ТЕКУЩЕМ КАДРЕ ---
+                instant_bar_y = compute_bar_y_from_hands(lm, ref_sh_w=base_shoulder_w)
+
+                # Если еще не накопилась базовая линия (первые кадры видео)
+                if manual_bar_y is None and not hang_bar_samples and not rep_bar_samples:
+                    hang_bar_samples.append(instant_bar_y)
+                    bar_y = float(np.median(hang_bar_samples))
+                    rep_bar_anchor_y = bar_y
+
                 nose = pt(LM.NOSE)
                 raw_chin_x, raw_chin_y = compute_anatomical_chin(lm, base_shoulder_w)
 
@@ -1056,8 +1103,6 @@ def analyze_video_pose(
                 filtered_chin_y = chin_y_filter.filter(raw_chin_y, current_time)
                 raw_shoulder_y = (l_sh[1] + r_sh[1]) / 2.0
                 shoulder_center_x = (l_sh[0] + r_sh[0]) / 2.0
-
-                wrist_y = (l_wr[1] + r_wr[1]) / 2.0
 
                 angle_el_l = calculate_angle(l_sh, l_el, l_wr)
                 angle_el_r = calculate_angle(r_sh, r_el, r_wr)
@@ -1174,6 +1219,20 @@ def analyze_video_pose(
 
                 hands_on_bar = abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
 
+                # --- ОБНОВЛЕНИЕ ЛИНИИ ПЕРЕКЛАДИНЫ НА КАЖДОЕ ПОДТЯГИВАНИЕ ---
+                if manual_bar_y is None and hands_on_bar and wrists_conf_ok:
+                    if state == "WAIT_HANG":
+                        # В висе перед каждым новым подтягиванием непрерывно обновляем стартовую высоту грифа
+                        hang_bar_samples.append(instant_bar_y)
+                        bar_y = float(np.median(hang_bar_samples))
+                        rep_bar_anchor_y = bar_y
+                    elif state in ("PULLING", "DESCENDING"):
+                        # Во время самого подтягивания плавно адаптируем линию перекладины под прогиб турника / движение камеры
+                        if abs(instant_bar_y - rep_bar_anchor_y) <= CONFIG["bar_max_Rep_drift"]:
+                            rep_bar_samples.append(instant_bar_y)
+                        if rep_bar_samples:
+                            bar_y = float(0.65 * rep_bar_anchor_y + 0.35 * float(np.median(rep_bar_samples)))
+
                 chin_reached = (
                     (
                         chin_y <= bar_y + CONFIG["chin_bar_tolerance"]
@@ -1190,6 +1249,11 @@ def analyze_video_pose(
                 if frame_idx <= 5 and state == "WAIT_HANG" and mean_elbow_angle < 65.0 and hands_on_bar:
                     state = "DESCENDING"
                     rep_start_time = 0.0
+                    if manual_bar_y is None:
+                        rep_bar_samples.clear()
+                        rep_bar_samples.append(instant_bar_y)
+                        bar_y = instant_bar_y
+                        rep_bar_anchor_y = bar_y
                     min_elbow_in_rep = mean_elbow_angle
                     min_shoulder_y_in_rep = shoulder_y
                     min_chin_y_in_rep = chin_y
@@ -1223,6 +1287,17 @@ def analyze_video_pose(
                         if mean_elbow_angle < CONFIG["pull_start_angle"] and hands_on_bar:
                             state = "PULLING"
                             rep_start_time = current_time
+
+                            # Фиксируем индивидуально обновленную линию перекладины на старт ЭТОГО подтягивания
+                            if manual_bar_y is None:
+                                if hang_bar_samples:
+                                    rep_bar_anchor_y = float(np.median(hang_bar_samples))
+                                else:
+                                    rep_bar_anchor_y = instant_bar_y
+                                rep_bar_samples.clear()
+                                rep_bar_samples.append(rep_bar_anchor_y)
+                                bar_y = rep_bar_anchor_y
+
                             min_elbow_in_rep = mean_elbow_angle
                             min_shoulder_y_in_rep = shoulder_y
                             min_chin_y_in_rep = chin_y
@@ -1268,6 +1343,7 @@ def analyze_video_pose(
                             reps_log.append({
                                 "rep_number": len(reps_log) + 1,
                                 "timestamp": f"{format_timestamp(rep_start_time)} – {format_timestamp(current_time)}",
+                                "bar_y": round(bar_y, 3),
                                 "valid": False,
                                 "status_text": "❌ Не засчитано",
                                 "ai_triggered": False,
@@ -1282,6 +1358,8 @@ def analyze_video_pose(
                         rep_errors = set()
                         pre_pull_knee_err.clear()
                         pre_pull_cross_err.clear()
+                        hang_bar_samples.clear()
+                        rep_bar_samples.clear()
                     else:
                         rep_frames += 1
 
@@ -1393,6 +1471,7 @@ def analyze_video_pose(
                                 reps_log.append({
                                     "rep_number": current_rep_num,
                                     "timestamp": f"{format_timestamp(rep_start_time)} – {format_timestamp(current_time)}",
+                                    "bar_y": round(bar_y, 3),
                                     "valid": is_valid,
                                     "status_text": status_str,
                                     "ai_triggered": ai_was_triggered,
@@ -1401,6 +1480,7 @@ def analyze_video_pose(
                                     "errors": sorted(rep_errors) if rep_errors else ["Нет ошибок"]
                                 })
 
+                            # Завершение попытки -> сбрасываем буфер грифа для свежей калибровки перед СЛЕДУЮЩИМ подтягиванием
                             state = "WAIT_HANG"
                             hang_start_time = current_time
                             last_hang_duration = 0.0
@@ -1408,6 +1488,13 @@ def analyze_video_pose(
                             rep_errors = set()
                             pre_pull_knee_err.clear()
                             pre_pull_cross_err.clear()
+                            if manual_bar_y is None:
+                                hang_bar_samples.clear()
+                                rep_bar_samples.clear()
+                                if hands_on_bar and wrists_conf_ok:
+                                    hang_bar_samples.append(instant_bar_y)
+                                    bar_y = instant_bar_y
+                                    rep_bar_anchor_y = bar_y
 
                 if writer is not None:
                     draw_skeleton(frame, lm, chin_pt=(chin_x, chin_y))
@@ -1446,6 +1533,7 @@ def analyze_video_pose(
                     bar_y=bar_y,
                     chin_above_now=chin_above_now,
                     active_errors=has_active_err,
+                    current_rep_idx=len(reps_log) + 1,
                     ai_calls_count=ai_calls_count,
                     ai_dispute_live=ai_dispute_live,
                     ai_banner_active=ai_banner_active,
@@ -1467,8 +1555,8 @@ def analyze_video_pose(
     ai_verified_list = [r["rep_number"] for r in reps_log if r.get("ai_triggered")]
 
     summary_lines = [
-        f"Повторение #{r['rep_number']} [{r['timestamp']}]: {r['status_text']} "
-        f"| ИИ-арбитр: {r.get('ai_indicator', '—')} "
+        f"Повторение #{r['rep_number']} [{r['timestamp']}] (Гриф Y={r.get('bar_y', bar_y):.3f}): "
+        f"{r['status_text']} | ИИ-арбитр: {r.get('ai_indicator', '—')} "
         f"({', '.join(r['errors'])})"
         for r in reps_log
     ]
@@ -1478,7 +1566,8 @@ def analyze_video_pose(
     result["bar_y"] = round(bar_y if bar_y is not None else 0.12, 3)
     result["errors"] = all_unique_errors
     result["reps_detail"] = reps_log
-    result["comment"] = "\n".join(summary_lines) if summary_lines else "Повторения не зафиксированы."
+    result["comment"] = "
+".join(summary_lines) if summary_lines else "Повторения не зафиксированы."
     result["tracked_video_path"] = final_video_path
     result["ai_referee_calls"] = ai_calls_count
     result["ai_referee_triggered"] = ai_calls_count > 0
