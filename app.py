@@ -139,6 +139,17 @@ def download_video_temp(file_id):
     return retry_drive_op(_op)
 
 
+def get_entry_ai_calls(entry):
+    """Возвращает количество срабатываний ИИ-арбитра для конкретного участника."""
+    if entry.get("ai_referee_calls") is not None:
+        return int(entry["ai_referee_calls"])
+    reps = entry.get("reps_detail", [])
+    return sum(
+        1 for r in reps
+        if isinstance(r, dict) and (r.get("ai_triggered") or "ИИ-арбитр" in str(r.get("status_text", "")))
+    )
+
+
 def build_team_standings_df(db_records):
     """Формирует таблицу командного зачета по сумме 10 лучших результатов каждой школы."""
     if not db_records:
@@ -155,11 +166,16 @@ def build_team_standings_df(db_records):
         checked_m = len(group[group["status"] == "Проверено"])
         top10_sum = int(group.sort_values(by="score", ascending=False).head(10)["score"].sum())
         coach_name = group["coach_fio"].iloc[-1] if "coach_fio" in group.columns else "—"
+
+        school_entries = [x for x in db_records if x.get("school") == sch]
+        ai_calls_team = sum(get_entry_ai_calls(x) for x in school_entries)
+
         team_rows.append({
             "Школа": sch,
             "Тренер (представитель)": coach_name,
             "Заявлено (10–12 чел.)": f"{total_m} чел.",
             "Проверено": f"{checked_m} из {total_m}",
+            "Вызовы ИИ-арбитра": f"🤖 {ai_calls_team}" if ai_calls_team > 0 else "⚪ 0",
             "Допуск команды (≥10 чел.)": "✅ Допущена" if total_m >= 10 else "⏳ Некомплект (<10)",
             "Сумма 10 лучших": top10_sum,
             "_is_eligible": 1 if total_m >= 10 else 0
@@ -174,7 +190,7 @@ def build_team_standings_df(db_records):
 
 
 def build_school_roster_df(school_entries):
-    """Формирует таблицу участников внутри конкретной школы с отметкой вхождения в Топ-10."""
+    """Формирует таблицу участников внутри конкретной школы с отметкой Топ-10 и индикатором ИИ-арбитра."""
     sorted_entries = sorted(
         school_entries,
         key=lambda x: (
@@ -199,15 +215,26 @@ def build_school_roster_df(school_entries):
     for idx, item in enumerate(sorted_entries, start=1):
         is_checked = item.get("status") == "Проверено"
         v_reps = item.get("verified_reps")
+        ai_calls = get_entry_ai_calls(item)
+        ai_reps = item.get("ai_verified_reps") or [
+            r.get("rep_number") for r in item.get("reps_detail", [])
+            if isinstance(r, dict) and (r.get("ai_triggered") or "ИИ-арбитр" in str(r.get("status_text", "")))
+        ]
 
         if not is_checked or v_reps is None:
             top10_label = "⏳ Ожидание проверки"
             status_label = "🟡 На проверке"
             v_reps_display = "—"
+            ai_badge = "⏳ Ожидание"
         else:
             v_reps_display = str(int(v_reps))
             status_label = "🟢 Проверено"
             top10_label = "✅ В зачете Топ-10" if item["id"] in top10_set else "➖ Запасной (11–12)"
+            if ai_calls > 0:
+                reps_str = ", ".join(f"#{r}" for r in ai_reps) if ai_reps else ""
+                ai_badge = f"🤖 Сработал ({ai_calls}x: {reps_str})" if reps_str else f"🤖 Сработал ({ai_calls}x)"
+            else:
+                ai_badge = "⚪ Локально (YOLO)"
 
         err_list = item.get("errors", [])
         if is_checked:
@@ -222,6 +249,7 @@ def build_school_roster_df(school_entries):
             "Заявлено": item.get("claimed_reps", 0),
             "Засчитано": v_reps_display,
             "Учет в Топ-10": top10_label,
+            "Индикатор ИИ-арбитра": ai_badge,
             "Статус": status_label,
             "Примечание судейской системы": err_text
         })
@@ -250,11 +278,11 @@ st.markdown(
     "**Формат:** Командный зачет (состав команды 10–12 человек, зачет по сумме 10 лучших результатов)"
 )
 
-with st.expander("🤖 Архитектура компьютерного зрения (Pose Estimation) и критерии"):
+with st.expander("🤖 Гибридная архитектура судейства (YOLOv8-Pose + ИИ-арбитр Gemini) и критерии"):
     st.markdown("""
-    * **Отслеживание ключевых точек (MediaPipe Pose):** кисти, локти, плечи, подбородок, тазобедренные суставы, колени и лодыжки.
-    * **Контроль исходного положения (ИП):** вис хватом сверху, руки и ноги прямые, ступни вместе без скрещивания, обязательная фиксация неподвижного виса **не менее 1,0 секунды** перед началом каждого подъема.
-    * **Контроль подъема и верхней точки:** пересечение подбородком горизонтальной линии грифа перекладины, равномерное сгибание рук без рывков и махов ногами (туловищем).
+    * **Локальное ядро трекинга (YOLOv8-Pose + 1€ Filter):** высокоточное отслеживание ключевых точек (кисти, локти, плечи, подбородок, таз, колени и лодыжки) со стабилизацией скелета.
+    * **Мультимодальный ИИ-арбитр (Gemini 3.5 Flash):** автоматически подключается при любых пограничных и спорных ситуациях (особенно по **высоте подбородка у грифа**, **асимметрии сгибания рук** и **скрещиванию ног**), анализируя раскадровку трех фаз повторения (`1. HANG` $\rightarrow$ `2. MID PULL` $\rightarrow$ `3. PEAK`).
+    * **Отдельный индикатор ИИ-арбитра:** фиксирует каждое срабатывание нейросетевого судьи как на самом видео с трекингом (`AI REFEREE TRIGGERED`), так и в сводных протоколах.
     """)
 
 st.divider()
@@ -267,7 +295,6 @@ col_reg, col_board = st.columns([1.0, 1.4], gap="large")
 with col_reg:
     st.subheader("📥 Регистрация команды школы")
 
-    # Если школа еще не зафиксирована в текущей сессии — показываем Шаг 1
     if st.session_state.active_school is None:
         st.markdown("##### Шаг 1. Данные школы и тренера (вводятся один раз)")
 
@@ -318,7 +345,6 @@ with col_reg:
                         }
                         st.rerun()
 
-    # Если школа зафиксирована — показываем карточку школы и Шаг 2 (добавление участников)
     else:
         act = st.session_state.active_school
         school_entries = [
@@ -377,6 +403,9 @@ with col_reg:
                                 "bar_y": None,
                                 "errors": [],
                                 "reps_detail": [],
+                                "ai_referee_calls": 0,
+                                "ai_referee_triggered": False,
+                                "ai_verified_reps": [],
                                 "comment": "",
                                 "file_id": file_id,
                                 "video_url": web_link
@@ -418,12 +447,13 @@ with col_board:
             sch_name = team_row["Школа"]
             top10_val = team_row["Сумма 10 лучших"]
             checked_info = team_row["Проверено"]
+            ai_team_info = team_row["Вызовы ИИ-арбитра"]
             coach_str = team_row["Тренер (представитель)"]
 
             sch_entries = [x for x in st.session_state.db if x.get("school") == sch_name]
             with st.expander(
                 f"Место #{rank} | 🏫 {sch_name} — Сумма Топ-10: {top10_val} | "
-                f"Проверено: {checked_info} | Тренер: {coach_str}"
+                f"Проверено: {checked_info} | ИИ-арбитр: {ai_team_info} | Тренер: {coach_str}"
             ):
                 df_roster = build_school_roster_df(sch_entries)
                 st.dataframe(df_roster, use_container_width=True, hide_index=True)
@@ -431,9 +461,9 @@ with col_board:
 st.divider()
 
 # =====================================================================
-# БЛОК 3: СУДЕЙСКИЙ МОДУЛЬ С ГРУППИРОВКОЙ ПО ШКОЛАМ И ПАКЕТНЫМ АНАЛИЗОМ
+# БЛОК 3: СУДЕЙСКИЙ МОДУЛЬ С ГРУППИРОВКОЙ ПО ШКОЛАМ И ИНДИКАТОРОМ ИИ-АРБИТРА
 # =====================================================================
-st.subheader("⚖️ Судейский модуль (Группировка по школам и поочередный Pose-анализ)")
+st.subheader("⚖️ Судейский модуль (Группировка по школам, Pose-анализ и индикатор ИИ-арбитра)")
 judge_pwd = st.text_input("Введите пароль судьи для доступа к проверке команд и управлению протоколами:", type="password")
 
 if judge_pwd:
@@ -447,7 +477,7 @@ if judge_pwd:
             with c_filt:
                 filter_status = st.radio(
                     "Фильтр участников внутри школ:",
-                    ["Все", "На проверке", "Проверено"],
+                    ["Все", "На проверке", "Проверено", "🤖 Сработал ИИ-арбитр"],
                     horizontal=True
                 )
             with c_exp:
@@ -465,7 +495,6 @@ if judge_pwd:
                     use_container_width=True
                 )
 
-            # Группируем все записи по школам
             schools_list = sorted({x["school"] for x in st.session_state.db if x.get("school")})
 
             for sch_idx, school_name in enumerate(schools_list):
@@ -481,18 +510,20 @@ if judge_pwd:
                     reverse=True
                 )
                 school_top10_sum = sum(scores_sorted[:10])
+                school_ai_calls = sum(get_entry_ai_calls(x) for x in all_school_entries)
 
                 with st.expander(
                     f"🏫 {school_name} | Участников: {len(all_school_entries)} (Проверено: {checked_count}/{len(all_school_entries)}) | "
-                    f"Командная сумма (Топ-10): {school_top10_sum} | Тренер: {coach_fio_val} ({coach_phone_val})",
+                    f"Командная сумма (Топ-10): {school_top10_sum} | 🤖 Вызовов ИИ-арбитра: {school_ai_calls} | "
+                    f"Тренер: {coach_fio_val} ({coach_phone_val})",
                     expanded=(len(unchecked_entries) > 0)
                 ):
                     st.markdown(
                         f"**Представитель (тренер):** {coach_fio_val} | **Телефон:** `{coach_phone_val}` | "
-                        f"**Статус командного зачета:** {'✅ Допущена (≥10 чел.)' if len(all_school_entries) >= 10 else f'⏳ Некомплект ({len(all_school_entries)} из 10)'}"
+                        f"**Статус командного зачета:** {'✅ Допущена (≥10 чел.)' if len(all_school_entries) >= 10 else f'⏳ Некомплект ({len(all_school_entries)} из 10)'} | "
+                        f"**Срабатываний ИИ-арбитра по школе:** `{school_ai_calls}`"
                     )
 
-                    # Кнопки пакетного запуска анализа и удаления всей команды школы
                     b_batch_new, b_batch_all, b_del_school = st.columns([1.35, 1.15, 0.85])
                     run_batch_target = None
 
@@ -574,6 +605,9 @@ if judge_pwd:
                                     item["bar_y"] = res.get("bar_y", 0.12)
                                     item["errors"] = res.get("errors", [])
                                     item["reps_detail"] = res.get("reps_detail", [])
+                                    item["ai_referee_calls"] = res.get("ai_referee_calls", 0)
+                                    item["ai_referee_triggered"] = res.get("ai_referee_triggered", False)
+                                    item["ai_verified_reps"] = res.get("ai_verified_reps", [])
                                     item["comment"] = res.get("comment", "")
                                     item["status"] = "Проверено"
 
@@ -599,21 +633,68 @@ if judge_pwd:
                     st.divider()
 
                     # Фильтрация участников внутри выбранной школы
-                    school_filtered = [
-                        x for x in all_school_entries
-                        if filter_status == "Все" or x.get("status") == filter_status
-                    ]
+                    school_filtered = []
+                    for x in all_school_entries:
+                        if filter_status == "Все":
+                            school_filtered.append(x)
+                        elif filter_status == "🤖 Сработал ИИ-арбитр":
+                            if get_entry_ai_calls(x) > 0:
+                                school_filtered.append(x)
+                        elif x.get("status") == filter_status:
+                            school_filtered.append(x)
 
                     if not school_filtered:
                         st.caption("В этой школе нет участников, соответствующих выбранному фильтру.")
 
                     # Индивидуальные карточки участников внутри школы
                     for entry in school_filtered:
+                        entry_ai_calls = get_entry_ai_calls(entry)
+                        ai_header_badge = (
+                            f" | 🤖 ИИ-арбитр: СРАБОТАЛ ({entry_ai_calls} раз)"
+                            if entry_ai_calls > 0
+                            else (" | ⚪ ИИ-арбитр: не требовался" if entry.get("status") == "Проверено" else "")
+                        )
+
                         with st.expander(
                             f"{'🟢' if entry['status']=='Проверено' else '🟡'} {entry['fio']} ({entry['grade']}) | "
-                            f"Заявлено: {entry['claimed_reps']} | Засчитано в зачет школы: {entry['verified_reps'] if entry['verified_reps'] is not None else '—'}"
+                            f"Заявлено: {entry['claimed_reps']} | "
+                            f"Засчитано в зачет школы: {entry['verified_reps'] if entry['verified_reps'] is not None else '—'}"
+                            f"{ai_header_badge}"
                         ):
-                            col_left, col_right = st.columns([1.2, 1.3])
+                            # ОТДЕЛЬНЫЙ ВИЗУАЛЬНЫЙ ИНДИКАТОР ИИ-АРБИТРА В ВЕРХНЕЙ ЧАСТИ КАРТОЧКИ УЧАСТНИКА
+                            reps_data = entry.get("reps_detail", [])
+                            ai_trig_reps = [
+                                str(r["rep_number"]) for r in reps_data
+                                if isinstance(r, dict) and (r.get("ai_triggered") or "ИИ-арбитр" in str(r.get("status_text", "")))
+                            ]
+
+                            ind_col1, ind_col2, ind_col3 = st.columns([1.1, 1.1, 2.2])
+                            with ind_col1:
+                                st.metric(
+                                    label="Статус ИИ-арбитра (Gemini)",
+                                    value="🤖 СРАБОТАЛ" if entry_ai_calls > 0 else ("⚪ ШТАТНО (YOLO)" if entry.get("status") == "Проверено" else "⏳ ОЖИДАНИЕ"),
+                                    delta=f"Вызовов: {entry_ai_calls}" if entry_ai_calls > 0 else None,
+                                    delta_color="normal"
+                                )
+                            with ind_col2:
+                                st.metric(
+                                    label="Проверенные ИИ попытки",
+                                    value=f"№ {', '.join(ai_trig_reps)}" if ai_trig_reps else "Нет спорных",
+                                )
+                            with ind_col3:
+                                if entry_ai_calls > 0:
+                                    st.warning(
+                                        f"🔔 **Индикатор ИИ-арбитра активен:** мультимодальная модель Gemini 3.5 Flash подключалась **{entry_ai_calls} раз(а)** "
+                                        f"(попытки № {', '.join(ai_trig_reps)}) для проверки спорного положения подбородка, асимметрии рук или скрещивания ног."
+                                    )
+                                elif entry.get("status") == "Проверено":
+                                    st.success(
+                                        "⚪ **Индикатор ИИ-арбитра:** пограничных спорных ситуаций не зафиксировано, все попытки оценены локальным детектором YOLOv8-Pose."
+                                    )
+                                else:
+                                    st.info("⏳ **Индикатор ИИ-арбитра:** ожидает запуска анализа видеозаписи.")
+
+                            col_left, col_right = st.columns([1.25, 1.25])
 
                             with col_left:
                                 st.markdown(f"🔗 **[Открыть исходное видео в Google Drive]({entry['video_url']})**")
@@ -663,7 +744,11 @@ if judge_pwd:
                                                 entry["bar_y"] = res.get("bar_y", 0.12)
                                                 entry["errors"] = res.get("errors", [])
                                                 entry["reps_detail"] = res.get("reps_detail", [])
+                                                entry["ai_referee_calls"] = res.get("ai_referee_calls", 0)
+                                                entry["ai_referee_triggered"] = res.get("ai_referee_triggered", False)
+                                                entry["ai_verified_reps"] = res.get("ai_verified_reps", [])
                                                 entry["comment"] = res.get("comment", "")
+                                                entry["status"] = "Проверено"
 
                                                 tracked_path = res.get("tracked_video_path")
                                                 if tracked_path and os.path.exists(tracked_path):
@@ -680,7 +765,7 @@ if judge_pwd:
                                                 os.remove(tmp_path)
 
                                 if entry["id"] in st.session_state.tracked_videos:
-                                    st.markdown("🎬 **Видеозапись с трекингом ключевых точек (MediaPipe Pose):**")
+                                    st.markdown("🎬 **Видеозапись с трекингом ключевых точек (YOLOv8-Pose + индикатор ИИ-арбитра):**")
                                     video_bytes = st.session_state.tracked_videos[entry["id"]]
                                     st.video(video_bytes)
                                     st.download_button(
@@ -692,14 +777,21 @@ if judge_pwd:
                                         use_container_width=True
                                     )
 
-                                if entry.get("reps_detail"):
-                                    st.markdown("**Протокол повторений по таймкодам:**")
-                                    df_reps = pd.DataFrame(entry["reps_detail"])
+                                if reps_data:
+                                    st.markdown("**Протокол повторений по таймкодам (с индикатором ИИ-арбитра):**")
+                                    df_reps = pd.DataFrame(reps_data)
                                     df_reps["errors"] = df_reps["errors"].apply(
                                         lambda lst: ", ".join(lst) if isinstance(lst, list) else str(lst)
                                     )
-                                    df_reps = df_reps[["rep_number", "timestamp", "status_text", "errors"]]
-                                    df_reps.columns = ["№", "Таймкод", "Вердикт", "Причина / Ошибки"]
+                                    if "ai_indicator" not in df_reps.columns:
+                                        df_reps["ai_indicator"] = df_reps["status_text"].apply(
+                                            lambda s: "🤖 Сработал" if "ИИ-арбитр" in str(s) else "⚪ Локально (YOLO)"
+                                        )
+                                    if "ai_verdict" not in df_reps.columns:
+                                        df_reps["ai_verdict"] = "—"
+
+                                    df_reps = df_reps[["rep_number", "timestamp", "status_text", "ai_indicator", "ai_verdict", "errors"]]
+                                    df_reps.columns = ["№", "Таймкод", "Вердикт", "Индикатор ИИ-арбитра", "Заключение ИИ", "Причина / Ошибки"]
                                     st.dataframe(df_reps, use_container_width=True, hide_index=True)
 
                             with col_right:
