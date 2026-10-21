@@ -373,21 +373,28 @@ class GeminiDisputeVerifier:
 
 def get_yolo_model():
     """
-    ПУНКТ 2 и 3: Ленивая загрузка модели YOLOv8n-Pose с автоматическим приоритетом
-    ускоренных весов OpenVINO или ONNX (если они экспортированы в папку проекта).
+    Ленивая загрузка модели для веб-приложения (Streamlit Cloud):
+    автоматически экспортирует yolov8n-pose.pt в ускоренный формат ONNX при первом старте.
     """
     global _MODEL_INSTANCE
     if _MODEL_INSTANCE is None:
         base_stem = os.path.splitext(YOLO_MODEL_NAME)[0]
-        openvino_dir = f"{base_stem}_openvino_model"
         onnx_file = f"{base_stem}.onnx"
 
-        if os.path.exists(openvino_dir):
-            _MODEL_INSTANCE = YOLO(openvino_dir, task="pose")
-        elif os.path.exists(onnx_file):
+        # Если ONNX-файл еще не создан на облачном сервере — создаем его автоматически
+        if not os.path.exists(onnx_file):
+            try:
+                pt_model = YOLO(YOLO_MODEL_NAME)
+                pt_model.export(format="onnx", imgsz=CONFIG["yolo_imgsz"], simplify=True)
+            except Exception as e:
+                print(f"Не удалось экспортировать в ONNX, используем стандартный .pt: {e}")
+
+        # Загружаем быстрый ONNX (или стандартный .pt, если экспорт не поддерживается средой)
+        if os.path.exists(onnx_file):
             _MODEL_INSTANCE = YOLO(onnx_file, task="pose")
         else:
             _MODEL_INSTANCE = YOLO(YOLO_MODEL_NAME)
+
     return _MODEL_INSTANCE
 
 
