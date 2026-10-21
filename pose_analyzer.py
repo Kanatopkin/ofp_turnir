@@ -373,26 +373,36 @@ class GeminiDisputeVerifier:
 
 def get_yolo_model():
     """
-    Ленивая загрузка модели для веб-приложения (Streamlit Cloud):
-    автоматически экспортирует yolov8n-pose.pt в ускоренный формат ONNX при первом старте.
+    Безопасная загрузка модели YOLOv8n-Pose:
+    использует ONNX только если установлен модуль onnxruntime,
+    иначе автоматически работает на стандартном .pt без ошибок.
     """
     global _MODEL_INSTANCE
     if _MODEL_INSTANCE is None:
+        has_onnxruntime = False
+        try:
+            import onnxruntime  # noqa: F401
+            has_onnxruntime = True
+        except ImportError:
+            has_onnxruntime = False
+
         base_stem = os.path.splitext(YOLO_MODEL_NAME)[0]
         onnx_file = f"{base_stem}.onnx"
 
-        # Если ONNX-файл еще не создан на облачном сервере — создаем его автоматически
-        if not os.path.exists(onnx_file):
-            try:
-                pt_model = YOLO(YOLO_MODEL_NAME)
-                pt_model.export(format="onnx", imgsz=CONFIG["yolo_imgsz"], simplify=True)
-            except Exception as e:
-                print(f"Не удалось экспортировать в ONNX, используем стандартный .pt: {e}")
+        if has_onnxruntime:
+            if not os.path.exists(onnx_file):
+                try:
+                    pt_model = YOLO(YOLO_MODEL_NAME)
+                    pt_model.export(format="onnx", imgsz=CONFIG["yolo_imgsz"], simplify=True)
+                except Exception:
+                    pass
 
-        # Загружаем быстрый ONNX (или стандартный .pt, если экспорт не поддерживается средой)
-        if os.path.exists(onnx_file):
-            _MODEL_INSTANCE = YOLO(onnx_file, task="pose")
+            if os.path.exists(onnx_file):
+                _MODEL_INSTANCE = YOLO(onnx_file, task="pose")
+            else:
+                _MODEL_INSTANCE = YOLO(YOLO_MODEL_NAME)
         else:
+            # Если onnxruntime нет на сервере — сразу загружаем .pt без ошибок
             _MODEL_INSTANCE = YOLO(YOLO_MODEL_NAME)
 
     return _MODEL_INSTANCE
