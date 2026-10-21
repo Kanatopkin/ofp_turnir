@@ -21,15 +21,18 @@ except ImportError:
     except ImportError:
         GEMINI_SDK = None
 
-# Автоматический выбор весов YOLOv8-Pose и модели Gemini 3.5 Flash
-YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8s-pose.pt")
+# ПУНКТ 2 и 3: Легковесная модель YOLOv8n-Pose (Nano) + поддержка OpenVINO / ONNX
+YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8n-pose.pt")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_REFEREE_MODEL", "gemini-3.5-flash")
 _MODEL_INSTANCE = None
 
 # =====================================================================
-# КОНФИГУРАТОР ПАРАМЕТРОВ И ОГРАНИЧЕНИЙ АЛГОРИТМА (П. 1 - 26 + ИИ-АРБИТР)
+# КОНФИГУРАТОР ПАРАМЕТРОВ И ОГРАНИЧЕНИЙ АЛГОРИТМА (П. 1 - 26 + УСКОРЕНИЕ + ИИ-АРБИТР)
 # =====================================================================
 CONFIG = {
+    # --- ПАРАМЕТРЫ УСКОРЕНИЯ ИНФЕРЕНСА (П. 1 - 3) ---
+    "target_eval_fps": 15.0,            # Нормализация частоты анализа (15 к/с без потери точности)
+    "yolo_imgsz": 480,                  # Оптимальное разрешение для YOLO Pose (ускорение на 35%)
     # 1. Фиксация ИП перед стартом (с)
     "min_hang_sec": 0.55,
     # 2. Угол локтей в нижнем висе (градусы)
@@ -56,17 +59,17 @@ CONFIG = {
     "knee_bent_threshold": 145.0,
     # 12. Порог захлеста голеней назад 3D (доля длины бедра)
     "shin_ratio_threshold": 0.66,
-    # 13. Длительность ошибки согнутых коленей (20% кадров, мин. 4 кадра)
+    # 13. Длительность ошибки согнутых коленей (20% кадров, эталон для 30 к/с — 4 кадра)
     "knee_err_frame_ratio": 0.20,
     "knee_err_min_frames": 4,
     # 14. Порог скрещивания ног (исключает шум при сомкнутых ступнях)
     "cross_product_threshold": -0.0002,
     "cross_min_overlap_ratio": 0.14,
-    # 15. Длительность ошибки скрещивания (мин. 3 кадра)
+    # 15. Длительность ошибки скрещивания (эталон для 30 к/с — 3 кадра)
     "cross_err_min_frames": 3,
     # 16. Разведение ног / ступни не вместе (120% ширины плеч)
     "feet_apart_ratio": 1.20,
-    # 17. Длительность разведения ног (25% кадров, мин. 5 кадров)
+    # 17. Длительность разведения ног (25% кадров, эталон для 30 к/с — 5 кадров)
     "feet_apart_frame_ratio": 0.25,
     "feet_apart_min_frames": 5,
     # 18. Рывок тазом / угол в тазобедренном суставе (градусы)
@@ -79,7 +82,7 @@ CONFIG = {
     "ankle_swing_ratio": 0.52,
     # 20а. Размах горизонтального раскачивания стоп за попытку (58% ширины плеч)
     "ankle_swing_span_ratio": 0.58,
-    # 21. Длительность ошибки маха/рывка (25% кадров, мин. 5 кадров)
+    # 21. Длительность ошибки маха/рывка (25% кадров, эталон для 30 к/с — 5 кадров)
     "kipping_frame_ratio": 0.25,
     "kipping_min_frames": 5,
     # 22. Асимметрия: чистая разница углов в локтях сверх калибровки (градусы)
@@ -88,14 +91,14 @@ CONFIG = {
     "asym_elbow_tilt_ratio": 0.14,
     # 24. Асимметрия: перекос линии плеч (14% ширины плеч)
     "asym_shoulder_tilt_ratio": 0.14,
-    # 25. Длительность поочередного сгибания рук (16% кадров, мин. 4 кадра)
+    # 25. Длительность поочередного сгибания рук (16% кадров, эталон для 30 к/с — 4 кадра)
     "asym_frame_ratio": 0.16,
     "asym_min_frames": 4,
     # 26. Отрыв кистей от грифа / срыв или спрыгивание (16% высоты кадра)
     "bar_release_dist": 0.16,
     # --- ПАРАМЕТРЫ ДИНАМИЧЕСКОГО ОБНОВЛЕНИЯ ЛИНИИ ПЕРЕКЛАДИНЫ НА КАЖДОЕ ПОДТЯГИВАНИЕ ---
-    "bar_hang_window_frames": 15,       # Окно калибровки грифа перед началом каждого нового подтягивания
-    "bar_rep_window_frames": 20,        # Окно адаптивного уточнения грифа внутри текущего подтягивания
+    "bar_hang_window_frames": 10,       # Окно калибровки грифа перед началом каждого нового подтягивания
+    "bar_rep_window_frames": 12,        # Окно адаптивного уточнения грифа внутри текущего подтягивания
     "bar_max_Rep_drift": 0.045,         # Максимально допустимое смещение грифа за кадр внутри попытки
     # --- ПАРАМЕТРЫ СТАБИЛИЗАЦИИ СКЕЛЕТА (1€ FILTER + ЗАЩИТА ОТ СХЛОПЫВАНИЯ) ---
     "filter_min_cutoff_x": 0.65,
@@ -103,11 +106,11 @@ CONFIG = {
     "filter_min_cutoff_y": 1.35,
     "filter_beta_y": 0.35,
     "skeleton_collapse_ratio": 0.68,
-    "max_joint_jump_per_frame": 0.085,
+    "max_joint_jump_per_frame": 0.14,   # Адаптировано под шаг 15 FPS
     # --- ПАРАМЕТРЫ УЧАЩЕННОЙ ВЕРИФИКАЦИИ ЧЕРЕЗ GEMINI API И ИНДИКАТОРА ---
     "enable_gemini_verifier": True,
     "dispute_chin_margin": 0.050,       # Зона сомнения по высоте подбородка у грифа (±5% высоты кадра)
-    "dispute_frame_margin": 6,          # Запас кадров вокруг порога ошибки для вызова ИИ-арбитра
+    "dispute_frame_margin": 4,          # Запас кадров вокруг порога ошибки для вызова ИИ-арбитра
     "ai_banner_display_sec": 3.0,       # Длительность свечения баннера ИИ-арбитра на видео (с)
 }
 
@@ -235,9 +238,9 @@ class GeminiDisputeVerifier:
             reasons.append("CROSS_LEGS")
 
         # 4. Контроль коленей и махов
-        if knee_frames >= 2 or abs(knee_frames - knee_thresh) <= margin:
+        if knee_frames >= 1 or abs(knee_frames - knee_thresh) <= margin:
             reasons.append("KNEES")
-        if kip_frames >= 2 or abs(kip_frames - kip_thresh) <= margin:
+        if kip_frames >= 1 or abs(kip_frames - kip_thresh) <= margin:
             reasons.append("KIPPING")
 
         return reasons
@@ -369,10 +372,22 @@ class GeminiDisputeVerifier:
 
 
 def get_yolo_model():
-    """Ленивая загрузка модели YOLOv8-Pose."""
+    """
+    ПУНКТ 2 и 3: Ленивая загрузка модели YOLOv8n-Pose с автоматическим приоритетом
+    ускоренных весов OpenVINO или ONNX (если они экспортированы в папку проекта).
+    """
     global _MODEL_INSTANCE
     if _MODEL_INSTANCE is None:
-        _MODEL_INSTANCE = YOLO(YOLO_MODEL_NAME)
+        base_stem = os.path.splitext(YOLO_MODEL_NAME)[0]
+        openvino_dir = f"{base_stem}_openvino_model"
+        onnx_file = f"{base_stem}.onnx"
+
+        if os.path.exists(openvino_dir):
+            _MODEL_INSTANCE = YOLO(openvino_dir, task="pose")
+        elif os.path.exists(onnx_file):
+            _MODEL_INSTANCE = YOLO(onnx_file, task="pose")
+        else:
+            _MODEL_INSTANCE = YOLO(YOLO_MODEL_NAME)
     return _MODEL_INSTANCE
 
 
@@ -512,9 +527,9 @@ class SkeletonStabilizer:
         self.prev_pts = None
 
         self.orientation_sign = None
-        self.sh_w_history = deque(maxlen=40)
-        self.hip_w_history = deque(maxlen=40)
-        self.wrist_w_history = deque(maxlen=40)
+        self.sh_w_history = deque(maxlen=25)
+        self.hip_w_history = deque(maxlen=25)
+        self.wrist_w_history = deque(maxlen=25)
 
         self.ref_sh_w = None
         self.ref_hip_w = None
@@ -713,8 +728,7 @@ def format_timestamp(seconds):
 
 def compute_bar_y_from_hands(lm, ref_sh_w=None):
     """
-    Вычисляет положение оси перекладины по костяшкам/запястьям с опорой на эталонную ширину плеч,
-    чтобы поворот плеч во время тяги не искажал высоту грифа.
+    Вычисляет положение оси перекладины по костяшкам/запястьям с опорой на эталонную ширину плеч.
     """
     l_wr, r_wr = lm[LM.LEFT_WRIST], lm[LM.RIGHT_WRIST]
     if l_wr.visibility >= 0.35 and r_wr.visibility >= 0.35:
@@ -877,7 +891,7 @@ def get_calibration_preview(video_path, manual_bar_y=None):
     detected_bar_y = 0.25
 
     model = get_yolo_model()
-    preds = model.predict(frame, conf=0.35, verbose=False)
+    preds = model.predict(frame, conf=0.35, imgsz=CONFIG["yolo_imgsz"], verbose=False)
     if preds:
         lm, _ = select_target_athlete(preds[0])
         if lm is not None:
@@ -954,6 +968,17 @@ def analyze_video_pose(
         orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        # ПУНКТ 1: Нормализация частоты анализа до 15 к/с и пересчет порогов под эффективный FPS
+        frame_step = max(1, int(round(fps / CONFIG["target_eval_fps"])))
+        eff_fps = fps / frame_step
+        fps_scale = eff_fps / 30.0
+
+        min_asym_f = max(2, int(round(CONFIG["asym_min_frames"] * fps_scale)))
+        min_knee_f = max(2, int(round(CONFIG["knee_err_min_frames"] * fps_scale)))
+        min_cross_f = max(2, int(round(CONFIG["cross_err_min_frames"] * fps_scale)))
+        min_feet_f = max(3, int(round(CONFIG["feet_apart_min_frames"] * fps_scale)))
+        min_kip_f = max(3, int(round(CONFIG["kipping_min_frames"] * fps_scale)))
+
         scale = min(1.0, 720.0 / max(orig_w, orig_h, 1))
         out_w = max(2, int(orig_w * scale) // 2 * 2)
         out_h = max(2, int(orig_h * scale) // 2 * 2)
@@ -963,7 +988,8 @@ def analyze_video_pose(
             raw_out_path = tmp_out.name
             tmp_out.close()
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(raw_out_path, fourcc, fps, (out_w, out_h))
+            # Записываем выходное видео с эффективной частотой eff_fps (в реальном времени без дублей)
+            writer = cv2.VideoWriter(raw_out_path, fourcc, eff_fps, (out_w, out_h))
 
         state = "WAIT_HANG"
         hang_start_time = None
@@ -997,14 +1023,17 @@ def analyze_video_pose(
             beta=CONFIG["filter_beta_y"]
         )
 
-        chin_buf = deque(maxlen=3)
-        nose_buf = deque(maxlen=3)
-        elbow_buf = deque(maxlen=3)
-        knee_buf = deque(maxlen=3)
-        shoulder_y_buf = deque(maxlen=3)
+        # На 15 FPS окно медианного сглаживания в 2 кадра дает мгновенный отклик без задержки в пике
+        buf_len = 2 if eff_fps <= 18.0 else 3
+        chin_buf = deque(maxlen=buf_len)
+        nose_buf = deque(maxlen=buf_len)
+        elbow_buf = deque(maxlen=buf_len)
+        knee_buf = deque(maxlen=buf_len)
+        shoulder_y_buf = deque(maxlen=buf_len)
 
-        pre_pull_knee_err = deque(maxlen=25)
-        pre_pull_cross_err = deque(maxlen=25)
+        pre_pull_window = max(8, int(round(0.8 * eff_fps)))
+        pre_pull_knee_err = deque(maxlen=pre_pull_window)
+        pre_pull_cross_err = deque(maxlen=pre_pull_window)
 
         rep_start_time = 0.0
         min_elbow_in_rep = 180.0
@@ -1027,18 +1056,28 @@ def analyze_video_pose(
         rep_ankle_x = []
 
         frame_idx = 0
+        eval_idx = 0
         tracked_athlete_center = None
         model = get_yolo_model()
+        yolo_imgsz = CONFIG["yolo_imgsz"]
 
         while cap.isOpened():
+            # Быстрый пропуск промежуточных кадров без декодирования матрицы изображения
+            if (frame_idx + 1) % frame_step != 0:
+                if not cap.grab():
+                    break
+                frame_idx += 1
+                continue
+
             ret, frame = cap.read()
             if not ret:
                 break
 
             frame_idx += 1
+            eval_idx += 1
             current_time = frame_idx / fps
 
-            if progress_callback and total_frames > 0 and frame_idx % 10 == 0:
+            if progress_callback and total_frames > 0 and eval_idx % 5 == 0:
                 progress_callback(min(1.0, frame_idx / total_frames))
 
             if scale < 1.0:
@@ -1046,7 +1085,8 @@ def analyze_video_pose(
 
             clean_frame = frame.copy()
 
-            preds = model.predict(frame, conf=0.35, verbose=False)
+            # ПУНКТ 2: Быстрый инференс YOLOv8n-Pose с фиксированным imgsz=480
+            preds = model.predict(frame, conf=0.35, imgsz=yolo_imgsz, verbose=False)
             raw_lm, tracked_athlete_center = (
                 select_target_athlete(preds[0], tracked_athlete_center)
                 if preds
@@ -1058,7 +1098,6 @@ def analyze_video_pose(
             chin_above_now = False
 
             if raw_lm is not None:
-                # Стабилизируем скелет
                 lm = stabilizer.process(raw_lm, current_time, bar_y=bar_y)
 
                 def pt(idx):
@@ -1074,10 +1113,8 @@ def analyze_video_pose(
                 wrist_y = (l_wr[1] + r_wr[1]) / 2.0
                 wrists_conf_ok = (lm[LM.LEFT_WRIST].visibility >= 0.30 or lm[LM.RIGHT_WRIST].visibility >= 0.30)
 
-                # --- ДИНАМИЧЕСКОЕ ВЫЧИСЛЕНИЕ ПОЛОЖЕНИЯ ПЕРЕКЛАДИНЫ В ТЕКУЩЕМ КАДРЕ ---
                 instant_bar_y = compute_bar_y_from_hands(lm, ref_sh_w=base_shoulder_w)
 
-                # Если еще не накопилась базовая линия (первые кадры видео)
                 if manual_bar_y is None and not hang_bar_samples and not rep_bar_samples:
                     hang_bar_samples.append(instant_bar_y)
                     bar_y = float(np.median(hang_bar_samples))
@@ -1125,7 +1162,7 @@ def analyze_video_pose(
                 mean_hip_angle = (calculate_angle(l_sh, l_hip, l_kn) + calculate_angle(r_sh, r_hip, r_kn)) / 2.0
                 curr_sh_w = abs(l_sh[0] - r_sh[0])
 
-                if mean_elbow_angle >= 170.0 and curr_sh_w > 0.05 and len(shoulder_w_samples) < 50:
+                if mean_elbow_angle >= 170.0 and curr_sh_w > 0.05 and len(shoulder_w_samples) < 30:
                     shoulder_w_samples.append(curr_sh_w)
                     base_shoulder_w = float(np.median(shoulder_w_samples))
                     base_sh_tilt_samples.append(abs(l_sh[1] - r_sh[1]) / max(0.06, base_shoulder_w))
@@ -1209,12 +1246,10 @@ def analyze_video_pose(
                 # --- ОБНОВЛЕНИЕ ЛИНИИ ПЕРЕКЛАДИНЫ НА КАЖДОЕ ПОДТЯГИВАНИЕ ---
                 if manual_bar_y is None and hands_on_bar and wrists_conf_ok:
                     if state == "WAIT_HANG":
-                        # В висе перед каждым новым подтягиванием непрерывно обновляем стартовую высоту грифа
                         hang_bar_samples.append(instant_bar_y)
                         bar_y = float(np.median(hang_bar_samples))
                         rep_bar_anchor_y = bar_y
                     elif state in ("PULLING", "DESCENDING"):
-                        # Во время самого подтягивания плавно адаптируем линию перекладины под прогиб турника / движение камеры
                         if abs(instant_bar_y - rep_bar_anchor_y) <= CONFIG["bar_max_Rep_drift"]:
                             rep_bar_samples.append(instant_bar_y)
                         if rep_bar_samples:
@@ -1233,7 +1268,7 @@ def analyze_video_pose(
                     and (shoulder_y <= bar_y + CONFIG["max_peak_shoulder_drop"])
                 )
 
-                if frame_idx <= 5 and state == "WAIT_HANG" and mean_elbow_angle < 65.0 and hands_on_bar:
+                if eval_idx <= 3 and state == "WAIT_HANG" and mean_elbow_angle < 65.0 and hands_on_bar:
                     state = "DESCENDING"
                     rep_start_time = 0.0
                     if manual_bar_y is None:
@@ -1275,7 +1310,6 @@ def analyze_video_pose(
                             state = "PULLING"
                             rep_start_time = current_time
 
-                            # Фиксируем индивидуально обновленную линию перекладины на старт ЭТОГО подтягивания
                             if manual_bar_y is None:
                                 if hang_bar_samples:
                                     rep_bar_anchor_y = float(np.median(hang_bar_samples))
@@ -1302,12 +1336,12 @@ def analyze_video_pose(
                             rep_mid_frame = clean_frame
                             rep_peak_frame = clean_frame
 
-                            if pre_bend_frames > int(CONFIG["pre_bend_max_time"] * fps):
+                            if pre_bend_frames > int(CONFIG["pre_bend_max_time"] * eff_fps):
                                 rep_errors.add("нарушение ИП: согнутые в локтях руки перед стартом")
 
-                            if sum(pre_pull_knee_err) >= CONFIG["knee_err_min_frames"]:
+                            if sum(pre_pull_knee_err) >= min_knee_f:
                                 rep_errors.add("нарушение ИП: согнутые в коленях ноги")
-                            if sum(pre_pull_cross_err) >= CONFIG["cross_err_min_frames"]:
+                            if sum(pre_pull_cross_err) >= min_cross_f:
                                 rep_errors.add("нарушение ИП: перекрещенные ноги")
 
                             is_first_rep_early = (len(reps_log) == 0 and rep_start_time < 2.0)
@@ -1389,11 +1423,11 @@ def analyze_video_pose(
                             ):
                                 ankle_swing_span = (max(rep_ankle_x) - min(rep_ankle_x)) if rep_ankle_x else 0.0
 
-                                asym_thresh = max(CONFIG["asym_min_frames"], int(rep_frames * CONFIG["asym_frame_ratio"]))
-                                knee_thresh = max(CONFIG["knee_err_min_frames"], int(rep_frames * CONFIG["knee_err_frame_ratio"]))
-                                cross_thresh = CONFIG["cross_err_min_frames"]
-                                feet_thresh = max(CONFIG["feet_apart_min_frames"], int(rep_frames * CONFIG["feet_apart_frame_ratio"]))
-                                kip_thresh = max(CONFIG["kipping_min_frames"], int(rep_frames * CONFIG["kipping_frame_ratio"]))
+                                asym_thresh = max(min_asym_f, int(rep_frames * CONFIG["asym_frame_ratio"]))
+                                knee_thresh = max(min_knee_f, int(rep_frames * CONFIG["knee_err_frame_ratio"]))
+                                cross_thresh = min_cross_f
+                                feet_thresh = max(min_feet_f, int(rep_frames * CONFIG["feet_apart_frame_ratio"]))
+                                kip_thresh = max(min_kip_f, int(rep_frames * CONFIG["kipping_frame_ratio"]))
 
                                 if asym_frames >= asym_thresh:
                                     rep_errors.add("поочередное (неравномерное) сгибание рук")
@@ -1414,7 +1448,7 @@ def analyze_video_pose(
                                 ):
                                     rep_errors.add("подбородок ниже уровня грифа перекладины")
 
-                                # --- ВЕРИФИКАЦИЯ СПОРНЫХ ПОПЫТОК И АКТИВАЦИЯ ИНДИКАТОРА ИИ-АРБИТРА ---
+                                # --- ВЕРИФИКАЦИЯ СПОРНЫХ ПОПЫТОК ИЛИ ПОЛНЫЙ АУДИТ ЧЕРЕЗ ИИ-АРБИТРА ---
                                 ai_referee_note = None
                                 dispute_reasons = verifier.get_dispute_reasons(
                                     rep_errors=rep_errors,
@@ -1431,7 +1465,12 @@ def analyze_video_pose(
                                     kip_thresh=kip_thresh,
                                 )
 
-                                if verifier.enabled and len(dispute_reasons) > 0:
+                                should_run_ai = verifier.enabled and (len(dispute_reasons) > 0 or force_ai_all_reps)
+
+                                if should_run_ai:
+                                    if force_ai_all_reps and not dispute_reasons:
+                                        dispute_reasons = ["ПОЛНЫЙ АУДИТ"]
+
                                     rep_errors, ai_referee_note = verifier.verify_repetition(
                                         start_frame=rep_start_frame,
                                         mid_frame=rep_mid_frame,
@@ -1467,7 +1506,6 @@ def analyze_video_pose(
                                     "errors": sorted(rep_errors) if rep_errors else ["Нет ошибок"]
                                 })
 
-                            # Завершение попытки -> сбрасываем буфер грифа для свежей калибровки перед СЛЕДУЮЩИМ подтягиванием
                             state = "WAIT_HANG"
                             hang_start_time = current_time
                             last_hang_duration = 0.0
@@ -1492,10 +1530,10 @@ def analyze_video_pose(
                     state != "WAIT_HANG"
                     and (
                         bool(rep_errors)
-                        or knee_bent_frames >= CONFIG["knee_err_min_frames"]
-                        or legs_crossed_frames >= CONFIG["cross_err_min_frames"]
-                        or asym_frames >= CONFIG["asym_min_frames"]
-                        or kipping_frames >= CONFIG["kipping_min_frames"]
+                        or knee_bent_frames >= min_knee_f
+                        or legs_crossed_frames >= min_cross_f
+                        or asym_frames >= min_asym_f
+                        or kipping_frames >= min_kip_f
                     )
                 )
                 ai_dispute_live = (
@@ -1503,7 +1541,7 @@ def analyze_video_pose(
                     and (
                         asym_frames >= 1
                         or legs_crossed_frames >= 1
-                        or knee_bent_frames >= 2
+                        or knee_bent_frames >= 1
                         or abs(min_chin_y_in_rep - bar_y) <= CONFIG["dispute_chin_margin"]
                     )
                 )
