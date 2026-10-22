@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# Безопасный импорт SDK для Gemini API
+# Безопасный импорт SDK для Gemini API (поддерживает новый google-genai)
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -22,8 +22,11 @@ except ImportError:
         GEMINI_SDK = None
 
 YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8n-pose.pt")
+
+# ЕДИНЫЙ СТАНДАРТ: Использование актуальной модели gemini-2.5-flash с авто-резервом
+GEMINI_MODEL_NAME = os.getenv("GEMINI_REFEREE_MODEL", "gemini-2.5-flash")
 GEMINI_FALLBACK_MODELS = [
-    os.getenv("GEMINI_REFEREE_MODEL", "gemini-2.5-flash"),
+    GEMINI_MODEL_NAME,
     "gemini-2.5-flash",
     "gemini-2.0-flash",
     "gemini-1.5-flash",
@@ -316,7 +319,7 @@ class GeminiDisputeVerifier:
         if last_err is not None or not raw_text.strip():
             err_msg = str(last_err) if last_err else "Пустой ответ от Gemini API"
             if "location is not supported" in err_msg.lower():
-                short_err = "⚠️ Блокировка региона Google API (включите VPN на ПК или запустите в Streamlit Cloud)"
+                short_err = "⚠️ Блокировка региона Google API (включите VPN на ПК или используйте Streamlit Cloud)"
             elif "api_key" in err_msg.lower() or "403" in err_msg or "401" in err_msg:
                 short_err = "⚠️ Неверный или заблокированный GEMINI_API_KEY"
             elif "429" in err_msg or "quota" in err_msg.lower():
@@ -888,21 +891,13 @@ def get_calibration_preview(video_path, manual_bar_y=None):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), round(detected_bar_y, 3)
 
 
-ddef convert_to_web_mp4(raw_video_path):
-    """
-    Гарантированная подготовка видео для воспроизведения в браузере.
-    Если перекодирование недоступно, возвращает исходный файл с правильным расширением.
-    """
+def convert_to_web_mp4(raw_video_path):
     if not os.path.exists(raw_video_path):
         return raw_video_path
-        
-    # Проверяем размер файла
     if os.path.getsize(raw_video_path) < 1000:
         return raw_video_path
 
     web_path = raw_video_path.replace(".mp4", "_web.mp4")
-    
-    # Пытаемся найти ffmpeg через imageio или систему
     ffmpeg_exe = shutil.which("ffmpeg")
     if not ffmpeg_exe:
         try:
@@ -919,7 +914,7 @@ ddef convert_to_web_mp4(raw_video_path):
                 "-preset", "ultrafast", "-crf", "28",
                 "-movflags", "+faststart", web_path
             ]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
             if res.returncode == 0 and os.path.exists(web_path) and os.path.getsize(web_path) > 1000:
                 try:
                     os.remove(raw_video_path)
@@ -929,10 +924,6 @@ ddef convert_to_web_mp4(raw_video_path):
         except Exception:
             pass
 
-    # Если ffmpeg не сработал, переименовываем файл, чтобы браузер воспринял его стандартно
-    if os.path.exists(raw_video_path):
-        return raw_video_path
-        
     return raw_video_path
 
 
