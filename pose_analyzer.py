@@ -22,42 +22,38 @@ except ImportError:
         GEMINI_SDK = None
 
 YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8n-pose.pt")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_REFEREE_MODEL", "gemini-3.5-flash")
+GEMINI_FALLBACK_MODELS = [
+    os.getenv("GEMINI_REFEREE_MODEL", "gemini-2.5-flash"),
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
 _MODEL_INSTANCE = None
 
 CONFIG = {
     "target_eval_fps": 15.0,
     "yolo_imgsz": 480,
-    # 1. Фиксация ИП перед стартом (с)
     "min_hang_sec": 0.80,
-    # 2. Угол локтей в нижнем висе (скорректирован до 158.0° для надежного учета виса)
     "elbow_ext_angle": 158.0,
-    # 3. Максимальное время нахождения на полусогнутых руках перед стартом (с)
     "pre_bend_max_time": 0.70,
-    # 4. Порог начала движения / старт тяги (градусы)
     "pull_start_angle": 146.0,
-    # 5. Минимальная глубина движения (градусы)
     "min_pull_depth_angle": 135.0,
-    # 6. Минимальная длительность попытки (с)
     "min_rep_duration": 0.45,
-    # 7. Допуск высоты подбородка относительно грифа
     "chin_bar_tolerance": 0.008,
-    # 8. Максимальный угол локтей в пике (градусы)
     "max_peak_elbow_angle": 52.0,
-    # 9. Порог прямоты ног в коленях
+    "nose_bar_margin": -0.010,
+    "max_peak_shoulder_drop": 0.055,
+    "min_chin_above_frames": 1,
     "knee_bent_threshold": 142.0,
     "shin_ratio_threshold": 0.65,
     "knee_err_frame_ratio": 0.25,
     "knee_err_min_frames": 3,
-    # 10. Скрещивание ног
     "cross_product_threshold": -0.0003,
     "cross_min_overlap_ratio": 0.16,
     "cross_err_min_frames": 3,
-    # 11. Разведение ног
     "feet_apart_ratio": 1.25,
     "feet_apart_frame_ratio": 0.30,
     "feet_apart_min_frames": 4,
-    # 12. Рывок тазом / мах
     "hip_kipping_angle": 148.0,
     "center_body_bend_angle": 162.0,
     "hip_swing_ratio": 0.65,
@@ -65,27 +61,22 @@ CONFIG = {
     "ankle_swing_span_ratio": 0.62,
     "kipping_frame_ratio": 0.25,
     "kipping_min_frames": 4,
-    # 13. Асимметрия рук (увеличен допуск до 22° и мин. 4 кадра для отсева шума)
     "asym_elbow_diff_deg": 22.0,
     "asym_elbow_tilt_ratio": 0.16,
     "asym_shoulder_tilt_ratio": 0.16,
     "asym_frame_ratio": 0.20,
     "asym_min_frames": 4,
-    # 14. Отрыв кистей от грифа
     "bar_release_dist": 0.18,
-    "release_confirm_frames": 4,        # Защита: срыв засчитывается только при 4 кадрах отсутствия рук
-    # 15. Калибровка перекладины
+    "release_confirm_frames": 4,
     "bar_hang_window_frames": 10,
     "bar_rep_window_frames": 12,
     "bar_max_Rep_drift": 0.045,
-    # Фильтрация 1€
     "filter_min_cutoff_x": 0.65,
     "filter_beta_x": 0.04,
     "filter_min_cutoff_y": 1.35,
     "filter_beta_y": 0.35,
     "skeleton_collapse_ratio": 0.68,
     "max_joint_jump_per_frame": 0.14,
-    # ИИ-арбитр
     "enable_gemini_verifier": True,
     "dispute_chin_margin": 0.050,
     "dispute_frame_margin": 4,
@@ -141,17 +132,25 @@ class StabilizedLandmark:
 
 
 def _resolve_gemini_api_key():
-    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if key:
-        return key
+    for env_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        val = os.getenv(env_name)
+        if val and str(val).strip():
+            return str(val).strip()
+
     try:
         import streamlit as st
-        if "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"]
-        if "GOOGLE_API_KEY" in st.secrets:
-            return st.secrets["GOOGLE_API_KEY"]
-        if "gemini" in st.secrets and "api_key" in st.secrets["gemini"]:
-            return st.secrets["gemini"]["api_key"]
+        secrets_dict = dict(st.secrets)
+
+        for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key", "google_api_key"):
+            if k in secrets_dict and str(secrets_dict[k]).strip():
+                return str(secrets_dict[k]).strip()
+
+        for _, sec_val in secrets_dict.items():
+            if hasattr(sec_val, "items"):
+                for sub_k, sub_v in sec_val.items():
+                    if sub_k.lower() in ("gemini_api_key", "google_api_key", "api_key"):
+                        if sub_v and str(sub_v).strip():
+                            return str(sub_v).strip()
     except Exception:
         pass
     return None
@@ -160,17 +159,26 @@ def _resolve_gemini_api_key():
 class GeminiDisputeVerifier:
     def __init__(self, enabled=True):
         self.api_key = _resolve_gemini_api_key()
-        self.enabled = bool(enabled and self.api_key and GEMINI_SDK is not None)
+        self.sdk = GEMINI_SDK
+        self.enabled = bool(enabled and self.api_key and self.sdk is not None)
         self.client = None
-        if self.enabled:
+        self.init_error = None
+
+        if not enabled:
+            self.init_error = "ИИ-арбитр отключен в настройках"
+        elif not self.api_key:
+            self.init_error = "Ключ GEMINI_API_KEY не найден в secrets.toml"
+        elif self.sdk is None:
+            self.init_error = "Библиотека google-genai не установлена"
+        else:
             try:
-                if GEMINI_SDK == "google-genai":
+                if self.sdk == "google-genai":
                     self.client = genai.Client(api_key=self.api_key)
-                elif GEMINI_SDK == "legacy":
+                elif self.sdk == "legacy":
                     genai_legacy.configure(api_key=self.api_key)
-                    self.client = genai_legacy.GenerativeModel(GEMINI_MODEL_NAME)
-            except Exception:
+            except Exception as e:
                 self.enabled = False
+                self.init_error = f"Ошибка инициализации клиента: {e}"
 
     @staticmethod
     def get_dispute_reasons(
@@ -197,10 +205,10 @@ class GeminiDisputeVerifier:
         ):
             reasons.append("CHIN")
 
-        if asym_frames >= 2 or abs(asym_frames - asym_thresh) <= margin:
+        if asym_frames >= 1 or abs(asym_frames - asym_thresh) <= margin or "поочередное (неравномерное) сгибание рук" in rep_errors:
             reasons.append("ASYM_ARMS")
 
-        if cross_frames >= 1 or abs(cross_frames - cross_thresh) <= margin:
+        if cross_frames >= 1 or abs(cross_frames - cross_thresh) <= margin or "нарушение ИП: перекрещенные ноги" in rep_errors:
             reasons.append("CROSS_LEGS")
 
         if knee_frames >= 1 or abs(knee_frames - knee_thresh) <= margin:
@@ -241,44 +249,83 @@ class GeminiDisputeVerifier:
 
     def verify_repetition(self, start_frame, mid_frame, peak_frame, bar_y, fsm_errors, min_elbow_deg):
         if not self.enabled:
-            return set(fsm_errors), None
+            return set(fsm_errors), f"⚠️ {self.init_error or 'ИИ-арбитр не настроен'}", False
 
         jpeg_bytes = self.build_storyboard_jpeg(start_frame, mid_frame, peak_frame, bar_y)
         if not jpeg_bytes:
-            return set(fsm_errors), None
+            return set(fsm_errors), "⚠️ Нет стоп-кадров для ИИ", False
 
         prompt = (
             "Ты — главный судья соревнований ГТО/ОФП по подтягиваниям на высокой перекладине.\n"
             "На изображении показаны 3 фазы попытки: 1. HANG (вис), 2. MID PULL (тяга), 3. PEAK (пик).\n"
             "Желтая линия — уровень грифа перекладины.\n"
-            f"Замечания датчика: {list(fsm_errors) if fsm_errors else ['Нет ошибок']} (угол локтей: {min_elbow_deg:.0f}°).\n\n"
+            f"Замечания локального датчика: {list(fsm_errors) if fsm_errors else ['Нет ошибок']} "
+            f"(угол локтей в пике: {min_elbow_deg:.0f}°).\n\n"
             "Проверь визуально:\n"
-            "1. chin_above_bar: Подбородок пересек уровень грифа на кадре 3 (PEAK)?\n"
-            "2. knees_straight: Ноги прямые в коленях?\n"
-            "3. legs_uncrossed: Ноги и стопы не скрещены?\n"
+            "1. chin_above_bar: Подбородок пересек желтую линию грифа на кадре 3 (PEAK)?\n"
+            "2. knees_straight: Ноги прямые в коленях на всех кадрах?\n"
+            "3. legs_uncrossed: Ноги и лодыжки НЕ скрещены?\n"
             "4. no_kipping: Подтягивание без рывков тазом и махов ногами?\n"
-            "5. arms_symmetric: Руки сгибаются синхронно, без явного перекоса?\n\n"
+            "5. arms_symmetric: Руки сгибаются равномерно без сильного перекоса плеч?\n\n"
             "Верни ТОЛЬКО валидный JSON:\n"
             '{"chin_above_bar": bool, "knees_straight": bool, "legs_uncrossed": bool, '
             '"no_kipping": bool, "arms_symmetric": bool, "short_reason": "краткий вывод до 8 слов"}'
         )
 
-        try:
-            raw_text = ""
-            if GEMINI_SDK == "google-genai":
-                response = self.client.models.generate_content(
-                    model=GEMINI_MODEL_NAME,
-                    contents=[genai_types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"), prompt],
-                    config=genai_types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json"),
-                )
-                raw_text = response.text or ""
-            elif GEMINI_SDK == "legacy":
-                response = self.client.generate_content(
-                    [{"mime_type": "image/jpeg", "data": jpeg_bytes}, prompt],
-                    generation_config={"temperature": 0.0, "response_mime_type": "application/json"},
-                )
-                raw_text = response.text or ""
+        last_err = None
+        raw_text = ""
 
+        seen_models = []
+        for model_name in GEMINI_FALLBACK_MODELS:
+            if model_name in seen_models:
+                continue
+            seen_models.append(model_name)
+
+            try:
+                if self.sdk == "google-genai":
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            genai_types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
+                            prompt,
+                        ],
+                        config=genai_types.GenerateContentConfig(
+                            temperature=0.0,
+                            response_mime_type="application/json",
+                        ),
+                    )
+                    raw_text = response.text or ""
+                elif self.sdk == "legacy":
+                    model_obj = genai_legacy.GenerativeModel(model_name)
+                    response = model_obj.generate_content(
+                        [{"mime_type": "image/jpeg", "data": jpeg_bytes}, prompt],
+                        generation_config={"temperature": 0.0, "response_mime_type": "application/json"},
+                    )
+                    raw_text = response.text or ""
+
+                if raw_text.strip():
+                    last_err = None
+                    break
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "location is not supported" in err_str.lower() or "api_key_invalid" in err_str.lower():
+                    break
+                continue
+
+        if last_err is not None or not raw_text.strip():
+            err_msg = str(last_err) if last_err else "Пустой ответ от Gemini API"
+            if "location is not supported" in err_msg.lower():
+                short_err = "⚠️ Блокировка региона Google API (включите VPN на ПК или запустите в Streamlit Cloud)"
+            elif "api_key" in err_msg.lower() or "403" in err_msg or "401" in err_msg:
+                short_err = "⚠️ Неверный или заблокированный GEMINI_API_KEY"
+            elif "429" in err_msg or "quota" in err_msg.lower():
+                short_err = "⚠️ Превышен лимит запросов Gemini API (429 Quota)"
+            else:
+                short_err = f"⚠️ Ошибка API: {err_msg[:70]}"
+            return set(fsm_errors), short_err, False
+
+        try:
             cleaned = raw_text.strip()
             if cleaned.startswith("```"):
                 cleaned = cleaned.strip("`").replace("json", "", 1).strip()
@@ -312,9 +359,9 @@ class GeminiDisputeVerifier:
                 updated_errors.discard("поочередное (неравномерное) сгибание рук")
 
             note = verdict.get("short_reason", "проверено ИИ-арбитром")
-            return updated_errors, note
-        except Exception:
-            return set(fsm_errors), None
+            return updated_errors, note, True
+        except Exception as e:
+            return set(fsm_errors), f"⚠️ Ошибка разбора ответа ИИ: {str(e)[:40]}", False
 
 
 def get_yolo_model():
@@ -841,19 +888,51 @@ def get_calibration_preview(video_path, manual_bar_y=None):
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), round(detected_bar_y, 3)
 
 
-def convert_to_web_mp4(raw_video_path):
+ddef convert_to_web_mp4(raw_video_path):
+    """
+    Гарантированная подготовка видео для воспроизведения в браузере.
+    Если перекодирование недоступно, возвращает исходный файл с правильным расширением.
+    """
+    if not os.path.exists(raw_video_path):
+        return raw_video_path
+        
+    # Проверяем размер файла
+    if os.path.getsize(raw_video_path) < 1000:
+        return raw_video_path
+
     web_path = raw_video_path.replace(".mp4", "_web.mp4")
-    if shutil.which("ffmpeg"):
-        cmd = [
-            "ffmpeg", "-y", "-i", raw_video_path,
-            "-vcodec", "libx264", "-pix_fmt", "yuv420p",
-            "-preset", "ultrafast", "-crf", "26",
-            "-movflags", "+faststart", web_path
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode == 0 and os.path.exists(web_path):
-            os.remove(raw_video_path)
-            return web_path
+    
+    # Пытаемся найти ffmpeg через imageio или систему
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if not ffmpeg_exe:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            ffmpeg_exe = None
+
+    if ffmpeg_exe:
+        try:
+            cmd = [
+                ffmpeg_exe, "-y", "-i", raw_video_path,
+                "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+                "-preset", "ultrafast", "-crf", "28",
+                "-movflags", "+faststart", web_path
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+            if res.returncode == 0 and os.path.exists(web_path) and os.path.getsize(web_path) > 1000:
+                try:
+                    os.remove(raw_video_path)
+                except OSError:
+                    pass
+                return web_path
+        except Exception:
+            pass
+
+    # Если ffmpeg не сработал, переименовываем файл, чтобы браузер воспринял его стандартно
+    if os.path.exists(raw_video_path):
+        return raw_video_path
+        
     return raw_video_path
 
 
@@ -927,7 +1006,7 @@ def analyze_video_pose(
         hang_start_time = None
         last_hang_duration = 0.0
         pre_bend_frames = 0
-        hands_lost_frames = 0  # Буфер для защиты от случайного срыва кисти
+        hands_lost_frames = 0
 
         hang_bar_samples = deque(maxlen=CONFIG["bar_hang_window_frames"])
         rep_bar_samples = deque(maxlen=CONFIG["bar_rep_window_frames"])
@@ -1170,7 +1249,6 @@ def analyze_video_pose(
                     or horizontal_swing
                 )
 
-                # Проверка удержания перекладины с защитой от единичного шума
                 hands_now_on_bar = abs(wrist_y - bar_y) < CONFIG["bar_release_dist"]
                 if hands_now_on_bar:
                     hands_lost_frames = 0
@@ -1208,7 +1286,6 @@ def analyze_video_pose(
                         pre_pull_knee_err.append(1 if knees_bent else 0)
                         pre_pull_cross_err.append(1 if legs_crossed else 0)
 
-                    # Учет времени виса (начиная со 158° в локтях)
                     if mean_elbow_angle >= elbow_ext_angle and hands_on_bar:
                         if hang_start_time is None:
                             hang_start_time = current_time
@@ -1262,7 +1339,6 @@ def analyze_video_pose(
                             if sum(pre_pull_cross_err) >= min_cross_f:
                                 rep_errors.add("нарушение ИП: перекрещенные ноги")
 
-                            # Учет виса перед стартом
                             is_first_rep_early = (len(reps_log) == 0 and rep_start_time < 2.0)
                             if not is_first_rep_early and last_hang_duration < min_hang_sec:
                                 rep_errors.add(f"фиксация ИП менее 1.0 сек ({last_hang_duration:.2f} с)")
@@ -1271,7 +1347,6 @@ def analyze_video_pose(
                             pre_bend_frames = 0
 
                 elif state in ("PULLING", "DESCENDING"):
-                    # Срыв засчитывается только если кисти оторваны несколько кадров подряд
                     if not hands_on_bar:
                         rep_duration = current_time - rep_start_time
                         if rep_duration >= 0.40 and min_elbow_in_rep <= 115.0:
@@ -1334,7 +1409,6 @@ def analyze_video_pose(
                         ):
                             state = "DESCENDING"
 
-                        # Опускание в вис: завершение повторения
                         if state == "DESCENDING" and mean_elbow_angle >= (elbow_ext_angle - 6.0):
                             rep_duration = current_time - rep_start_time
 
@@ -1369,7 +1443,6 @@ def analyze_video_pose(
                                 ):
                                     rep_errors.add("подбородок ниже уровня грифа перекладины")
 
-                                ai_referee_note = None
                                 dispute_reasons = verifier.get_dispute_reasons(
                                     rep_errors=rep_errors,
                                     min_chin_y=min_chin_y_in_rep,
@@ -1385,13 +1458,16 @@ def analyze_video_pose(
                                     kip_thresh=kip_thresh,
                                 )
 
-                                should_run_ai = verifier.enabled and (len(dispute_reasons) > 0 or force_ai_all_reps)
+                                should_run_ai = (len(dispute_reasons) > 0) or force_ai_all_reps
+                                ai_was_triggered = False
+                                ai_referee_note = "—"
+                                ai_indicator_str = "⚪ Локально (YOLO)"
 
                                 if should_run_ai:
                                     if force_ai_all_reps and not dispute_reasons:
                                         dispute_reasons = ["ПОЛНЫЙ АУДИТ"]
 
-                                    rep_errors, ai_referee_note = verifier.verify_repetition(
+                                    rep_errors, ai_referee_note, ai_ok = verifier.verify_repetition(
                                         start_frame=rep_start_frame,
                                         mid_frame=rep_mid_frame,
                                         peak_frame=rep_peak_frame,
@@ -1399,10 +1475,14 @@ def analyze_video_pose(
                                         fsm_errors=rep_errors,
                                         min_elbow_deg=min_elbow_in_rep,
                                     )
+                                    if ai_ok:
+                                        ai_was_triggered = True
+                                        ai_indicator_str = f"🤖 Сработал ({', '.join(dispute_reasons)})"
+                                    else:
+                                        ai_indicator_str = f"⚠️ Ошибка ИИ ({', '.join(dispute_reasons)})"
 
                                 is_valid = len(rep_errors) == 0
                                 current_rep_num = len(reps_log) + 1
-                                ai_was_triggered = ai_referee_note is not None
 
                                 if ai_was_triggered:
                                     ai_calls_count += 1
@@ -1421,12 +1501,11 @@ def analyze_video_pose(
                                     "valid": is_valid,
                                     "status_text": status_str,
                                     "ai_triggered": ai_was_triggered,
-                                    "ai_indicator": f"🤖 Сработал ({', '.join(dispute_reasons)})" if ai_was_triggered else "⚪ Локально (YOLO)",
-                                    "ai_verdict": ai_referee_note if ai_was_triggered else "—",
+                                    "ai_indicator": ai_indicator_str,
+                                    "ai_verdict": ai_referee_note,
                                     "errors": sorted(rep_errors) if rep_errors else ["Нет ошибок"]
                                 })
 
-                            # Старт отсчета виса для следующего подтягивания
                             state = "WAIT_HANG"
                             hang_start_time = current_time
                             last_hang_duration = 0.0
@@ -1460,7 +1539,7 @@ def analyze_video_pose(
                 ai_dispute_live = (
                     state != "WAIT_HANG"
                     and (
-                        asym_frames >= 2
+                        asym_frames >= 1
                         or legs_crossed_frames >= 1
                         or knee_bent_frames >= 1
                         or abs(min_chin_y_in_rep - bar_y) <= CONFIG["dispute_chin_margin"]
@@ -1503,6 +1582,7 @@ def analyze_video_pose(
     summary_lines = [
         f"Повторение #{r['rep_number']} [{r['timestamp']}] (Гриф Y={r.get('bar_y', bar_y):.3f}): "
         f"{r['status_text']} | ИИ-арбитр: {r.get('ai_indicator', '—')} "
+        f"| Заключение ИИ: {r.get('ai_verdict', '—')} "
         f"({', '.join(r['errors'])})"
         for r in reps_log
     ]
