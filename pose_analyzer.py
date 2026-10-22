@@ -915,6 +915,7 @@ def analyze_video_pose(
     elbow_ext_angle=CONFIG["elbow_ext_angle"],
     min_hang_sec=CONFIG["min_hang_sec"],
     generate_tracked_video=True,
+    force_ai_all_reps=False,
     progress_callback=None
 ):
     result = {
