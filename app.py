@@ -26,19 +26,24 @@ DB_FILENAME = "tournament_db.json"
 
 # --- НАДЕЖНОЕ ПОДКЛЮЧЕНИЕ К GOOGLE DRIVE ---
 def get_drive_service():
+    drive_scopes = ["https://www.googleapis.com/auth/drive"]
+    
     if "gdrive_oauth" in st.secrets:
         creds = Credentials(
             token=None,
             refresh_token=st.secrets["gdrive_oauth"]["refresh_token"],
-            token_uri="[https://oauth2.googleapis.com/token](https://oauth2.googleapis.com/token)",
+            token_uri="https://oauth2.googleapis.com/token",
             client_id=st.secrets["gdrive_oauth"]["client_id"],
             client_secret=st.secrets["gdrive_oauth"]["client_secret"],
-            scopes=["[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)"]
+            scopes=drive_scopes
         )
     else:
         creds_info = dict(st.secrets["gcp_service_account"])
+        # Удаляем scopes из словаря creds_info, если он был случайно туда скопирован
+        creds_info.pop("scopes", None)
         creds = service_account.Credentials.from_service_account_info(
-            creds_info, scopes=["[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)"]
+            creds_info, 
+            scopes=drive_scopes
         )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
