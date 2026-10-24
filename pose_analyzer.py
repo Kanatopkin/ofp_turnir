@@ -197,7 +197,7 @@ class GeminiDisputeVerifier:
     def _discover_working_model(self):
         """Опрашивает доступные модели через DoH/SmartDNS"""
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
+            url = f"https://gateway.ai.cloudflare.com/v1/.../generativelanguage.googleapis.com/v1beta/models/{clean_name}:generateContent?key={self.api_key}"
             req = urllib.request.Request(
                 url, 
                 headers={
