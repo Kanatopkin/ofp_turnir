@@ -1139,7 +1139,7 @@ def analyze_video_pose(
 
         pre_pull_window = max(6, int(round(0.7 * eff_fps)))
         pre_pull_knee_err = deque(maxlen=pre_pull_window)
-        pre_pull_cross_err = deque(maxlen=pre_pull_cross_err_len := max(6, int(round(0.7 * eff_fps))))
+        pre_pull_cross_err = deque(maxlen=pre_pull_window)
 
         rep_start_time = 0.0
         rep_saved_hang_time = None
@@ -1204,6 +1204,7 @@ def analyze_video_pose(
             chin_above_now = False
 
             if raw_lm is not None:
+                # Точная калибровка перекладины ТОЛЬКО по первому чистому вису
                 if not bar_is_locked:
                     instant_bar_y = compute_bar_y_from_hands(raw_lm, ref_sh_w=base_shoulder_w)
                     if 0.115 <= instant_bar_y <= 0.200:
