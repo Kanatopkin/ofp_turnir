@@ -195,22 +195,26 @@ class GeminiDisputeVerifier:
                 self.init_error = f"Ошибка инициализации SDK: {e}"
 
     def _discover_working_model(self):
-        """Опрашивает доступные модели через DoH-шлюз"""
+        """Опрашивает доступные модели через DoH/SmartDNS"""
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(
+                url, 
+                headers={
+                    "x-goog-api-key": self.api_key,
+                    "User-Agent": "Mozilla/5.0"
+                }
+            )
             with urllib.request.urlopen(req, timeout=10.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 models = data.get("models", [])
                 
-                # 1. Приоритет быстрым Flash-моделям с поддержкой generateContent
                 for m in models:
                     methods = m.get("supportedGenerationMethods", [])
                     name = m.get("name", "").replace("models/", "")
                     if "generateContent" in methods and "flash" in name.lower() and "8b" not in name.lower():
                         return name
                         
-                # 2. Любая доступная модель Gemini
                 for m in models:
                     methods = m.get("supportedGenerationMethods", [])
                     name = m.get("name", "").replace("models/", "")
