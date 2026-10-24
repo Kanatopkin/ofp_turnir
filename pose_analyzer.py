@@ -190,7 +190,7 @@ class GeminiDisputeVerifier:
                 self.init_error = f"Ошибка инициализации SDK: {e}"
 
     def _discover_working_model(self):
-        """Опрашивает Google API и выбирает первую доступную мультимодальную модель."""
+        """Опрашивает Google API и выбирает модель, строго поддерживающую generateContent."""
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
             req = urllib.request.Request(url)
@@ -198,14 +198,14 @@ class GeminiDisputeVerifier:
                 data = json.loads(resp.read().decode("utf-8"))
                 models = data.get("models", [])
                 
-                # 1. Приоритет быстрым Flash-моделям
+                # Ищем Flash-модели с поддержкой generateContent
                 for m in models:
                     methods = m.get("supportedGenerationMethods", [])
                     name = m.get("name", "").replace("models/", "")
-                    if "generateContent" in methods and "flash" in name.lower():
+                    if "generateContent" in methods and "flash" in name.lower() and "8b" not in name.lower():
                         return name
-                        
-                # 2. Любая доступная модель Gemini с поддержкой генерации
+
+                # Ищем любую модель Gemini с поддержкой generateContent
                 for m in models:
                     methods = m.get("supportedGenerationMethods", [])
                     name = m.get("name", "").replace("models/", "")
