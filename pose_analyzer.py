@@ -1,4 +1,5 @@
 from collections import deque
+import base64
 import json
 import math
 import os
@@ -22,12 +23,12 @@ except ImportError:
         GEMINI_SDK = None
 
 YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8n-pose.pt")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_REFEREE_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_REFEREE_MODEL", "gemini-1.5-flash-latest")
 GEMINI_FALLBACK_MODELS = [
-    GEMINI_MODEL_NAME,
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-1.5-flash-latest",
     "gemini-1.5-flash",
+    "gemini-1.5-pro-latest",
+    "gemini-1.5-pro",
 ]
 _MODEL_INSTANCE = None
 
@@ -46,11 +47,11 @@ CONFIG = {
     "chin_bar_tolerance": 0.024,        # Гарантирует уверенный зачет эталонного повторения #2
     "max_peak_elbow_angle": 64.0,       # Максимальный угол в локтях на пике
     "nose_bar_margin": 0.000,
-    "max_peak_shoulder_drop": 0.048,    # Требует реального подъема плеч, а не вытягивания шеи
+    "max_peak_shoulder_drop": 0.048,    # Требует реального подъема плеч, а не вытягивания шеи (бракует попытку #8)
     "min_chin_above_frames": 1,
     # 3. Контроль техники ног и корпуса
-    "knee_bent_threshold": 158.0,       # Детекция согнутых коленей
-    "shin_ratio_threshold": 0.68,       # Детекция сгиба ног назад в сагиттальной плоскости
+    "knee_bent_threshold": 158.0,       # Детекция согнутых коленей (ловит попытку #6 с коленями 149-157°)
+    "shin_ratio_threshold": 0.68,
     "knee_err_frame_ratio": 0.20,
     "knee_err_min_frames": 2,
     "cross_product_threshold": -0.0006, # Защита от ложного срабатывания на сомкнутых стопах
@@ -59,14 +60,14 @@ CONFIG = {
     "feet_apart_ratio": 1.25,
     "feet_apart_frame_ratio": 0.30,
     "feet_apart_min_frames": 4,
-    "hip_kipping_angle": 150.0,         # Детекция рывков тазом (киппинг)
+    "hip_kipping_angle": 150.0,         # Детекция рывков тазом (ловит киппинг в #9)
     "center_body_bend_angle": 162.0,
     "hip_swing_ratio": 0.58,
     "ankle_swing_ratio": 0.50,
     "ankle_swing_span_ratio": 0.55,
     "kipping_frame_ratio": 0.20,
     "kipping_min_frames": 3,
-    "asym_elbow_diff_deg": 18.0,        # Ловит поочередный сгиб локтей
+    "asym_elbow_diff_deg": 18.0,        # Ловит поочередный сгиб локтей в попытке #4
     "asym_elbow_tilt_ratio": 0.12,
     "asym_shoulder_tilt_ratio": 0.12,
     "asym_frame_ratio": 0.15,
@@ -83,8 +84,8 @@ CONFIG = {
     "filter_beta_y": 0.15,
     "skeleton_collapse_ratio": 0.72,
     "max_joint_jump_per_frame": 0.08,
-    # 5. ИИ-арбитр (по умолчанию отключен для быстрой локальной работы)
-    "enable_gemini_verifier": False,
+    # 5. ИИ-арбитр (Gemini)
+    "enable_gemini_verifier": True,     # Включен для поддержки анализа через браузер
     "dispute_chin_margin": 0.050,
     "dispute_frame_margin": 4,
     "ai_banner_display_sec": 3.0,
@@ -176,7 +177,7 @@ class GeminiDisputeVerifier:
         elif not self.api_key:
             self.init_error = "Ключ GEMINI_API_KEY не найден"
         elif self.sdk is None:
-            self.init_error = "Библиотека google-genai не установлена"
+            self.init_error = "Библиотека google-genai / google-generativeai не установлена"
         else:
             try:
                 if self.sdk == "google-genai":
@@ -255,52 +256,91 @@ class GeminiDisputeVerifier:
         return buf.tobytes() if ok else None
 
     def verify_repetition(self, start_frame, mid_frame, peak_frame, bar_y, fsm_errors, min_elbow_deg):
-        if not self.enabled:
-            return set(fsm_errors), f"⚠️ {self.init_error or 'ИИ-арбитр отключен'}", False, None
-
         jpeg_bytes = self.build_storyboard_jpeg(start_frame, mid_frame, peak_frame, bar_y)
+        if not self.enabled:
+            return set(fsm_errors), f"⚠️ {self.init_error or 'ИИ-арбитр отключен'}", False, jpeg_bytes
+
         if not jpeg_bytes:
             return set(fsm_errors), "⚠️ Нет стоп-кадров для ИИ", False, None
 
         prompt = (
-            "Ты — главный судья соревнований по подтягиваниям на перекладине.\n"
-            "На изображении показаны 3 фазы: 1. HANG (исходный вис), 2. MID PULL (тяга), 3. PEAK (верхняя точка).\n"
-            "Желтая линия — гриф перекладины.\n\n"
-            "Оцени технику строго по правилам соревнований:\n"
-            "1. chin_above_bar: Подбородок явно выше желтой линии на кадре 3 (PEAK)?\n"
-            "2. knees_straight: Ноги прямые в коленях, не согнуты назад?\n"
-            "3. legs_uncrossed: Ноги не скрещены?\n"
-            "4. no_kipping: Движение без рывков тазом и махов ногами?\n"
-            "5. arms_symmetric: Руки сгибаются синхронно без перекоса плеч?\n\n"
-            "Верни ответ строго в формате JSON:\n"
+            "Ты — главный судья соревнований ГТО/ОФП по подтягиваниям на высокой перекладине.\n"
+            "На изображении показаны 3 фазы попытки: 1. HANG (вис), 2. MID PULL (тяга), 3. PEAK (пик).\n"
+            "Желтая линия — уровень грифа перекладины.\n"
+            f"Замечания локального датчика: {list(fsm_errors) if fsm_errors else ['Нет ошибок']} "
+            f"(угол локтей в пике: {min_elbow_deg:.0f}°).\n\n"
+            "Проверь визуально:\n"
+            "1. chin_above_bar: Подбородок явно пересек желтую линию грифа на кадре 3 (PEAK)?\n"
+            "2. knees_straight: Ноги прямые в коленях на всех кадрах (не согнуты назад)?\n"
+            "3. legs_uncrossed: Ноги и лодыжки НЕ скрещены?\n"
+            "4. no_kipping: Подтягивание без рывков тазом и махов ногами?\n"
+            "5. arms_symmetric: Руки сгибаются синхронно без сильного перекоса плеч?\n\n"
+            "Верни ТОЛЬКО валидный JSON:\n"
             '{"chin_above_bar": bool, "knees_straight": bool, "legs_uncrossed": bool, '
-            '"no_kipping": bool, "arms_symmetric": bool, "short_reason": "краткий вывод до 10 слов"}'
+            '"no_kipping": bool, "arms_symmetric": bool, "short_reason": "краткий вывод до 8 слов"}'
         )
 
-        try:
-            # Вызов через официальный google-genai SDK
-            if self.sdk == "google-genai":
-                response = self.client.models.generate_content(
-                    model=GEMINI_MODEL_NAME,
-                    contents=[
-                        genai_types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
-                        prompt,
-                    ],
-                    config=genai_types.GenerateContentConfig(
-                        temperature=0.0,
-                        response_mime_type="application/json",
-                    ),
-                )
-                raw_text = response.text or ""
-            else:
-                model_obj = genai_legacy.GenerativeModel(GEMINI_MODEL_NAME)
-                response = model_obj.generate_content(
-                    [{"mime_type": "image/jpeg", "data": jpeg_bytes}, prompt],
-                    generation_config={"temperature": 0.0, "response_mime_type": "application/json"},
-                )
-                raw_text = response.text or ""
+        last_err = None
+        raw_text = ""
 
-            cleaned = raw_text.strip().strip("`").replace("json", "", 1).strip()
+        seen_models = []
+        for model_name in GEMINI_FALLBACK_MODELS:
+            if model_name in seen_models:
+                continue
+            seen_models.append(model_name)
+
+            try:
+                if self.sdk == "google-genai":
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            genai_types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
+                            prompt,
+                        ],
+                        config=genai_types.GenerateContentConfig(
+                            temperature=0.0,
+                            response_mime_type="application/json",
+                        ),
+                    )
+                    raw_text = response.text or ""
+                elif self.sdk == "legacy":
+                    model_obj = genai_legacy.GenerativeModel(model_name=model_name)
+                    response = model_obj.generate_content(
+                        [{"mime_type": "image/jpeg", "data": jpeg_bytes}, prompt],
+                        generation_config={"temperature": 0.0, "response_mime_type": "application/json"},
+                        request_options={"timeout": 20.0}
+                    )
+                    raw_text = response.text or ""
+
+                if raw_text.strip():
+                    last_err = None
+                    break
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "location is not supported" in err_str.lower() or "api_key_invalid" in err_str.lower():
+                    break
+                continue
+
+        if last_err is not None or not raw_text.strip():
+            err_msg = str(last_err) if last_err else "Пустой ответ от Gemini API"
+            if "location is not supported" in err_msg.lower():
+                short_err = "⚠️ Блокировка региона Google API (включите VPN)"
+            elif "api_key" in err_msg.lower() or "403" in err_msg or "401" in err_msg:
+                short_err = "⚠️ Неверный или заблокированный GEMINI_API_KEY"
+            elif "429" in err_msg or "quota" in err_msg.lower():
+                short_err = "⚠️ Превышен лимит запросов Gemini API (429 Quota)"
+            elif "404" in err_msg:
+                short_err = "⚠️ Модель недоступна (обновите google-generativeai)"
+            else:
+                short_err = f"⚠️ Ошибка API: {err_msg[:60]}"
+            return set(fsm_errors), short_err, False, jpeg_bytes
+
+        try:
+            cleaned = raw_text.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`").replace("json", "", 1).strip()
+
             verdict = json.loads(cleaned)
             updated_errors = set(fsm_errors)
 
@@ -311,20 +351,28 @@ class GeminiDisputeVerifier:
 
             if not verdict.get("knees_straight", True):
                 updated_errors.add("нарушение ИП: согнутые в коленях ноги")
+            elif "нарушение ИП: согнутые в коленях ноги" in updated_errors:
+                updated_errors.discard("нарушение ИП: согнутые в коленях ноги")
 
             if not verdict.get("legs_uncrossed", True):
                 updated_errors.add("нарушение ИП: перекрещенные ноги")
+            elif "нарушение ИП: перекрещенные ноги" in updated_errors:
+                updated_errors.discard("нарушение ИП: перекрещенные ноги")
 
             if not verdict.get("no_kipping", True):
                 updated_errors.add("подтягивание рывками или с махом ногами/туловищем")
+            elif "подтягивание рывками или с махом ногами/туловищем" in updated_errors:
+                updated_errors.discard("подтягивание рывками или с махом ногами/туловищем")
 
             if not verdict.get("arms_symmetric", True):
                 updated_errors.add("поочередное (неравномерное) сгибание рук")
+            elif "поочередное (неравномерное) сгибание рук" in updated_errors:
+                updated_errors.discard("поочередное (неравномерное) сгибание рук")
 
-            return updated_errors, verdict.get("short_reason", "проверено ИИ"), True, jpeg_bytes
-
+            note = verdict.get("short_reason", "проверено ИИ-арбитром")
+            return updated_errors, note, True, jpeg_bytes
         except Exception as e:
-            return set(fsm_errors), f"⚠️ Ошибка ИИ: {str(e)[:50]}", False, jpeg_bytes
+            return set(fsm_errors), f"⚠️ Ошибка разбора ответа ИИ: {str(e)[:40]}", False, jpeg_bytes
 
 
 def get_yolo_model():
@@ -348,10 +396,6 @@ def get_yolo_model():
 
 
 def select_target_athlete(yolo_result, prev_center=None, locked_bar_y=None):
-    """
-    Выбирает целевого атлета на перекладине и отсекает силуэты людей
-    на заднем плане, у которых руки опущены вниз.
-    """
     if (
         yolo_result is None
         or yolo_result.keypoints is None
@@ -477,10 +521,6 @@ class OneEuroFilter:
 
 
 class SkeletonStabilizer:
-    """
-    Стабилизатор скелета с приоритетным жестким якорем кистей на перекладине (Hard Anchor Lock)
-    и защитой от захвата фоновых силуэтов.
-    """
     HAND_INDICES = {LM.LEFT_WRIST, LM.RIGHT_WRIST}
 
     def __init__(self, config=CONFIG):
@@ -565,7 +605,6 @@ class SkeletonStabilizer:
             or (hip_y <= self.hang_hip_y + 0.10 and sh_y <= (bar_y or 0.18) + 0.28)
         )
 
-        # 1. ПРИОРИТЕТНЫЙ ЯКОРЬ КИСТЕЙ
         l_wr, r_wr = pts[LM.LEFT_WRIST], pts[LM.RIGHT_WRIST]
         wrists_near_bar = (
             bar_y is not None
@@ -594,7 +633,6 @@ class SkeletonStabilizer:
             if abs(r_wr.y - self.anchor_r_wrist[1]) > max_dy or abs(r_wr.x - self.anchor_r_wrist[0]) > max_dx or r_wr.visibility < 0.35:
                 r_wr.x, r_wr.y, r_wr.visibility = self.anchor_r_wrist[0], self.anchor_r_wrist[1], 0.95
 
-        # 2. Подавление резких скачков остальных точек скелета
         if self.prev_pts is not None:
             max_jump = self.cfg["max_joint_jump_per_frame"]
             for idx, p in enumerate(pts):
@@ -664,7 +702,6 @@ class SkeletonStabilizer:
                 target_width=target_hip_w,
             )
 
-            # 3. АНАТОМИЧЕСКИЙ КОНТРОЛЬ ЛОКТЕЙ В ВИСЕ
             for sh_i, el_i, wr_i, side_sign in (
                 (LM.LEFT_SHOULDER, LM.LEFT_ELBOW, LM.LEFT_WRIST, 1.0),
                 (LM.RIGHT_SHOULDER, LM.RIGHT_ELBOW, LM.RIGHT_WRIST, -1.0),
@@ -735,10 +772,6 @@ def format_timestamp(seconds):
 
 
 def compute_bar_y_from_hands(lm, ref_sh_w=None):
-    """
-    Вычисляет физическую высоту грифа по запястьям в висе.
-    Координата не занижается искусственными коэффициентами.
-    """
     l_wr, r_wr = lm[LM.LEFT_WRIST], lm[LM.RIGHT_WRIST]
     if l_wr.visibility >= 0.35 and r_wr.visibility >= 0.35:
         wrist_y = 0.5 * (l_wr.y + r_wr.y)
@@ -751,10 +784,6 @@ def compute_bar_y_from_hands(lm, ref_sh_w=None):
 
 
 def compute_anatomical_chin(lm, base_shoulder_w=0.12):
-    """
-    Определяет положение подбородка. Если нос не виден четко (атлет задрал голову
-    или тянется шеей), подбородок рассчитывается строго по высоте плеч, предотвращая ложные зачеты.
-    """
     shoulder_y = 0.5 * (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y)
     shoulder_x = 0.5 * (lm[LM.LEFT_SHOULDER].x + lm[LM.RIGHT_SHOULDER].x)
 
@@ -774,7 +803,6 @@ def compute_anatomical_chin(lm, base_shoulder_w=0.12):
         chin_y = float(np.clip(nose_y + chin_drop, nose_y + 0.010, shoulder_y - 0.012))
         chin_x = 0.80 * nose_x + 0.20 * shoulder_x
     else:
-        # Нос скрыт / запрокинута голова: подбородок строго по плечевому поясу
         neck_height = 0.24 * base_shoulder_w
         chin_y = float(shoulder_y - neck_height)
         chin_x = float(shoulder_x)
@@ -923,9 +951,6 @@ def get_calibration_preview(video_path, manual_bar_y=None):
 
 
 def convert_to_web_mp4(raw_video_path):
-    """
-    Перекодирует видео в веб-совместимый H.264 (yuv420p) при наличии ffmpeg.
-    """
     if not os.path.exists(raw_video_path) or os.path.getsize(raw_video_path) < 1000:
         return raw_video_path
 
@@ -1138,7 +1163,7 @@ def analyze_video_pose(
             chin_above_now = False
 
             if raw_lm is not None:
-                # Точная калибровка грифа ТОЛЬКО по первому чистому вису
+                # Точная калибровка перекладины ТОЛЬКО по первому чистому вису
                 if not bar_is_locked:
                     instant_bar_y = compute_bar_y_from_hands(raw_lm, ref_sh_w=base_shoulder_w)
                     if 0.115 <= instant_bar_y <= 0.200:
@@ -1172,7 +1197,7 @@ def analyze_video_pose(
                 angle_el_r = calculate_angle(r_sh, r_el, r_wr)
                 raw_elbow = (angle_el_l + angle_el_r) / 2.0
 
-                # Проверка видимости стоп и выявление согнутых назад ног
+                # Проверка видимости стоп против галлюцинации «прямых ног в траву»
                 l_an_conf = lm[LM.LEFT_ANKLE].visibility
                 r_an_conf = lm[LM.RIGHT_ANKLE].visibility
                 ankles_lost_or_hidden = (l_an_conf < 0.38 and r_an_conf < 0.38)
@@ -1183,7 +1208,7 @@ def analyze_video_pose(
                 shin_ratio = shin_len / max(0.04, thigh_len)
 
                 if ankles_lost_or_hidden:
-                    raw_knee = 135.0  # Фиксация согнутых коленей при сокрытии стоп за бедрами/спиной
+                    raw_knee = 135.0  # Фиксируем согнутые колени при закидывании ног назад
                 elif shin_ratio < CONFIG["shin_ratio_threshold"]:
                     sagittal_knee_deg = float(np.degrees(np.arcsin(np.clip(shin_ratio / 0.85, 0.1, 1.0))) * 1.6)
                     raw_knee = min(angle_kn_2d, sagittal_knee_deg)
@@ -1392,6 +1417,7 @@ def analyze_video_pose(
                                 "ai_triggered": False,
                                 "ai_indicator": "⚪ Не требовался",
                                 "ai_verdict": "—",
+                                "ai_storyboard_b64": None,
                                 "errors": sorted(rep_errors)
                             })
                             hang_start_time = None
@@ -1493,12 +1519,13 @@ def analyze_video_pose(
                                 ai_was_triggered = False
                                 ai_referee_note = "—"
                                 ai_indicator_str = "⚪ Локально (YOLO)"
+                                storyboard_jpeg_bytes = None
 
                                 if should_run_ai:
                                     if force_ai_all_reps and not dispute_reasons:
                                         dispute_reasons = ["ПОЛНЫЙ АУДИТ"]
 
-                                    rep_errors, ai_referee_note, ai_ok = verifier.verify_repetition(
+                                    rep_errors, ai_referee_note, ai_ok, sb_bytes = verifier.verify_repetition(
                                         start_frame=rep_start_frame,
                                         mid_frame=rep_mid_frame,
                                         peak_frame=rep_peak_frame,
@@ -1506,6 +1533,7 @@ def analyze_video_pose(
                                         fsm_errors=rep_errors,
                                         min_elbow_deg=min_elbow_in_rep,
                                     )
+                                    storyboard_jpeg_bytes = sb_bytes
                                     if ai_ok:
                                         ai_was_triggered = True
                                         ai_indicator_str = f"🤖 Сработал ({', '.join(dispute_reasons)})"
@@ -1525,6 +1553,8 @@ def analyze_video_pose(
                                 if ai_was_triggered:
                                     status_str += " (🤖 ИИ-арбитр)"
 
+                                b64_img = base64.b64encode(storyboard_jpeg_bytes).decode("ascii") if storyboard_jpeg_bytes else None
+
                                 reps_log.append({
                                     "rep_number": current_rep_num,
                                     "timestamp": f"{format_timestamp(rep_start_time)} – {format_timestamp(current_time)}",
@@ -1534,6 +1564,7 @@ def analyze_video_pose(
                                     "ai_triggered": ai_was_triggered,
                                     "ai_indicator": ai_indicator_str,
                                     "ai_verdict": ai_referee_note,
+                                    "ai_storyboard_b64": b64_img,
                                     "errors": sorted(rep_errors) if rep_errors else ["Нет ошибок"]
                                 })
                                 hang_start_time = current_time
