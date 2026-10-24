@@ -4,6 +4,7 @@ import json
 import io
 import os
 import ssl
+import base64
 import tempfile
 import time
 from datetime import datetime
@@ -29,15 +30,15 @@ def get_drive_service():
         creds = Credentials(
             token=None,
             refresh_token=st.secrets["gdrive_oauth"]["refresh_token"],
-            token_uri="https://oauth2.googleapis.com/token",
+            token_uri="[https://oauth2.googleapis.com/token](https://oauth2.googleapis.com/token)",
             client_id=st.secrets["gdrive_oauth"]["client_id"],
             client_secret=st.secrets["gdrive_oauth"]["client_secret"],
-            scopes=["https://www.googleapis.com/auth/drive"]
+            scopes=["[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)"]
         )
     else:
         creds_info = dict(st.secrets["gcp_service_account"])
         creds = service_account.Credentials.from_service_account_info(
-            creds_info, scopes=["https://www.googleapis.com/auth/drive"]
+            creds_info, scopes=["[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)"]
         )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -114,7 +115,6 @@ def upload_video_to_drive(uploaded_file, filename):
 
 
 def delete_file_from_drive(file_id):
-    """Безопасное удаление видеофайла из Google Drive при удалении участника или школы."""
     if not file_id:
         return
     try:
@@ -140,7 +140,6 @@ def download_video_temp(file_id):
 
 
 def get_entry_ai_calls(entry):
-    """Возвращает количество срабатываний ИИ-арбитра для конкретного участника."""
     if entry.get("ai_referee_calls") is not None:
         return int(entry["ai_referee_calls"])
     reps = entry.get("reps_detail", [])
@@ -151,7 +150,6 @@ def get_entry_ai_calls(entry):
 
 
 def build_team_standings_df(db_records):
-    """Формирует таблицу командного зачета по сумме 10 лучших результатов каждой школы."""
     if not db_records:
         return pd.DataFrame()
 
@@ -190,7 +188,6 @@ def build_team_standings_df(db_records):
 
 
 def build_school_roster_df(school_entries):
-    """Формирует таблицу участников внутри конкретной школы с отметкой Топ-10 и индикатором ИИ-арбитра."""
     sorted_entries = sorted(
         school_entries,
         key=lambda x: (
@@ -280,15 +277,15 @@ st.markdown(
 
 with st.expander("🤖 Гибридная архитектура судейства (YOLOv8-Pose + ИИ-арбитр Gemini) и критерии"):
     st.markdown("""
-    * **Локальное ядро трекинга (YOLOv8-Pose + 1€ Filter):** высокоточное отслеживание ключевых точек со стабилизацией скелета и динамической перекалибровкой линии перекладины на каждое подтягивание.
-    * **Мультимодальный ИИ-арбитр (Gemini 3.5 Flash):** автоматически подключается при пограничных ситуациях или принудительно запускается по кнопке **«🧠 Перепроверить всё через ИИ»** для полной независимой экспертизы всех повторений.
-    * **Контроль техники:** проверка чистоты виса (от 1.0 с), пересечения грифа подбородком, отсутствия рывков/махов, синхронности рук и отсутствия скрещивания ног.
+    * **Локальное ядро трекинга (YOLOv8-Pose + 1€ Filter):** высокоточное отслеживание ключевых точек со стабилизацией скелета и защитой от закидывания ног за спину.
+    * **Мультимодальный ИИ-арбитр (Gemini 2.5 Flash):** автоматически подключается при спорных ситуациях или запускается по кнопке **«🧠 Перепроверить всё через ИИ»** для покадровой визуальной экспертизы прямо в браузере.
+    * **Контроль техники:** проверка чистоты виса (от 0.82 с), пересечения грифа подбородком, отсутствия рывков/махов, синхронности рук и отсутствия скрещивания ног.
     """)
 
 st.divider()
 
 # =====================================================================
-# БЛОК 1: РЕГИСТРАЦИЯ ШКОЛЫ (1 РАЗ) И ПОСЛЕДОВАТЕЛЬНОЕ ДОБАВЛЕНИЕ УЧАСТНИКОВ
+# БЛОК 1: РЕГИСТРАЦИЯ ШКОЛЫ И УЧАСТНИКОВ
 # =====================================================================
 col_reg, col_board = st.columns([1.0, 1.4], gap="large")
 
@@ -420,7 +417,7 @@ with col_reg:
                 st.dataframe(build_school_roster_df(school_entries), use_container_width=True, hide_index=True)
 
 # =====================================================================
-# БЛОК 2: ОНЛАЙН-ТАБЛО КОМАНДНОГО ЗАЧЕТА + РАСКРЫВАЮЩИЕСЯ СОСТАВЫ ШКОЛ
+# БЛОК 2: ОНЛАЙН-ТАБЛО КОМАНДНОГО ЗАЧЕТА
 # =====================================================================
 with col_board:
     col_title, col_sync = st.columns([3, 1])
@@ -461,9 +458,9 @@ with col_board:
 st.divider()
 
 # =====================================================================
-# БЛОК 3: СУДЕЙСКИЙ МОДУЛЬ С ГРУППИРОВКОЙ ПО ШКОЛАМ И ИНДИКАТОРОМ ИИ-АРБИТРА
+# БЛОК 3: СУДЕЙСКИЙ МОДУЛЬ С ПРОВЕРКОЙ ЧЕРЕЗ БРАУЗЕР
 # =====================================================================
-st.subheader("⚖️ Судейский модуль (Группировка по школам, Pose-анализ и индикатор ИИ-арбитра)")
+st.subheader("⚖️ Судейский модуль (Группировка по школам, Pose-анализ и экспертиза ИИ в браузере)")
 judge_pwd = st.text_input("Введите пароль судьи для доступа к проверке команд и управлению протоколами:", type="password")
 
 if judge_pwd:
@@ -575,7 +572,7 @@ if judge_pwd:
                                 st.success(f"Команда школы «{school_name}» полностью удалена!")
                                 st.rerun()
 
-                    # ПООЧЕРЕДНОЕ ВЫПОЛНЕНИЕ АНАЛИЗА И ГЕНЕРАЦИИ ВИДЕО ДЛЯ ШКОЛЫ
+                    # ПАКЕТНАЯ ОБРАБОТКА
                     if run_batch_target:
                         total_q = len(run_batch_target)
                         overall_bar = st.progress(0.0, text=f"Подготовка к поочередной обработке школы «{school_name}» (0/{total_q})...")
@@ -603,7 +600,7 @@ if judge_pwd:
                                 )
                                 if isinstance(res, dict):
                                     item["verified_reps"] = res.get("valid_reps", 0)
-                                    item["bar_y"] = res.get("bar_y", 0.12)
+                                    item["bar_y"] = res.get("bar_y", 0.155)
                                     item["errors"] = res.get("errors", [])
                                     item["reps_detail"] = res.get("reps_detail", [])
                                     item["ai_referee_calls"] = res.get("ai_referee_calls", 0)
@@ -627,13 +624,12 @@ if judge_pwd:
 
                         overall_bar.progress(1.0, text=f"✅ Все участники школы «{school_name}» ({total_q} чел.) успешно обработаны!")
                         frame_bar.empty()
-                        status_box.success(f"Пакетный анализ школы «{school_name}» завершен! Все видео с трекингом доступны ниже.")
+                        status_box.success(f"Пакетный анализ школы «{school_name}» завершен!")
                         time.sleep(0.8)
                         st.rerun()
 
                     st.divider()
 
-                    # Фильтрация участников внутри выбранной школы
                     school_filtered = []
                     for x in all_school_entries:
                         if filter_status == "Все":
@@ -647,7 +643,6 @@ if judge_pwd:
                     if not school_filtered:
                         st.caption("В этой школе нет участников, соответствующих выбранному фильтру.")
 
-                    # Индивидуальные карточки участников внутри школы
                     for entry in school_filtered:
                         entry_ai_calls = get_entry_ai_calls(entry)
                         ai_header_badge = (
@@ -662,7 +657,6 @@ if judge_pwd:
                             f"Засчитано в зачет школы: {entry['verified_reps'] if entry['verified_reps'] is not None else '—'}"
                             f"{ai_header_badge}"
                         ):
-                            # ОТДЕЛЬНЫЙ ВИЗУАЛЬНЫЙ ИНДИКАТОР ИИ-АРБИТРА В ВЕРХНЕЙ ЧАСТИ КАРТОЧКИ УЧАСТНИКА
                             reps_data = entry.get("reps_detail", [])
                             ai_trig_reps = [
                                 str(r["rep_number"]) for r in reps_data
@@ -685,12 +679,12 @@ if judge_pwd:
                             with ind_col3:
                                 if entry_ai_calls > 0:
                                     st.warning(
-                                        f"🔔 **Индикатор ИИ-арбитра активен:** мультимодальная модель Gemini 3.5 Flash подключалась **{entry_ai_calls} раз(а)** "
-                                        f"(попытки № {', '.join(ai_trig_reps)}) для проверки спорного положения подбородка, асимметрии рук или скрещивания ног."
+                                        f"🔔 **Индикатор ИИ-арбитра активен:** мультимодальная модель Gemini подключалась **{entry_ai_calls} раз(а)** "
+                                        f"(попытки № {', '.join(ai_trig_reps)}) для проверки положения подбородка, асимметрии рук или закидывания ног."
                                     )
                                 elif entry.get("status") == "Проверено":
                                     st.success(
-                                        "⚪ **Индикатор ИИ-арбитра:** пограничных спорных ситуаций не зафиксировано, все попытки оценены локальным детектором YOLOv8-Pose."
+                                        "⚪ **Индикатор ИИ-арбитра:** техника проверена локальным детектором, спорных ситуаций не выявлено."
                                     )
                                 else:
                                     st.info("⏳ **Индикатор ИИ-арбитра:** ожидает запуска анализа видеозаписи.")
@@ -709,12 +703,12 @@ if judge_pwd:
                                     manual_bar_val = st.slider(
                                         "Высота грифа перекладины Y (0.0 — верх кадра, 1.0 — низ кадра):",
                                         min_value=0.05, max_value=0.80,
-                                        value=float(entry["bar_y"]) if entry.get("bar_y") else 0.12,
-                                        step=0.01,
+                                        value=float(entry["bar_y"]) if entry.get("bar_y") else 0.155,
+                                        step=0.005,
                                         key=f"slider_bar_{entry['id']}"
                                     )
 
-                                b_prev, b_run, b_full_ai = st.columns([1, 1, 1.25])
+                                b_prev, b_run, b_full_ai = st.columns([1, 1, 1.35])
                                 with b_prev:
                                     if st.button("👁️ Калибровка", key=f"prev_{entry['id']}", use_container_width=True):
                                         with st.spinner("Загрузка кадра и поиск кистей..."):
@@ -722,14 +716,14 @@ if judge_pwd:
                                             try:
                                                 img, auto_y = get_calibration_preview(tmp_path, manual_bar_val)
                                                 if img is not None:
-                                                    st.image(img, caption=f"Линия грифа (авто-определение: Y={auto_y})", use_container_width=True)
+                                                    st.image(img, caption=f"Линия грифа (определение: Y={auto_y})", use_container_width=True)
                                             finally:
                                                 if os.path.exists(tmp_path):
                                                     os.remove(tmp_path)
 
                                 with b_run:
                                     if st.button("🤖 Анализ (YOLO)", key=f"pose_{entry['id']}", use_container_width=True):
-                                        prog_bar = st.progress(0.0, text="Покадровая обработка и запись видео...")
+                                        prog_bar = st.progress(0.0, text="Покадровая обработка и трекинг скелета...")
                                         tmp_path = download_video_temp(entry["file_id"])
                                         try:
                                             res = analyze_video_pose(
@@ -743,7 +737,7 @@ if judge_pwd:
 
                                             if isinstance(res, dict):
                                                 entry["verified_reps"] = res.get("valid_reps", 0)
-                                                entry["bar_y"] = res.get("bar_y", 0.12)
+                                                entry["bar_y"] = res.get("bar_y", 0.155)
                                                 entry["errors"] = res.get("errors", [])
                                                 entry["reps_detail"] = res.get("reps_detail", [])
                                                 entry["ai_referee_calls"] = res.get("ai_referee_calls", 0)
@@ -768,7 +762,7 @@ if judge_pwd:
 
                                 with b_full_ai:
                                     if st.button("🧠 Перепроверить всё через ИИ", key=f"ai_full_{entry['id']}", use_container_width=True):
-                                        prog_bar = st.progress(0.0, text="Полный аудит: экспертиза КАЖДОГО повторения через Gemini 3.5 Flash...")
+                                        prog_bar = st.progress(0.0, text="Экспертиза ИИ-арбитра Gemini через браузер...")
                                         tmp_path = download_video_temp(entry["file_id"])
                                         try:
                                             res = analyze_video_pose(
@@ -782,7 +776,7 @@ if judge_pwd:
 
                                             if isinstance(res, dict):
                                                 entry["verified_reps"] = res.get("valid_reps", 0)
-                                                entry["bar_y"] = res.get("bar_y", 0.12)
+                                                entry["bar_y"] = res.get("bar_y", 0.155)
                                                 entry["errors"] = res.get("errors", [])
                                                 entry["reps_detail"] = res.get("reps_detail", [])
                                                 entry["ai_referee_calls"] = res.get("ai_referee_calls", 0)
@@ -798,7 +792,7 @@ if judge_pwd:
                                                     os.remove(tracked_path)
 
                                                 save_db(st.session_state.db)
-                                                st.success("Полная экспертиза через ИИ-арбитра завершена!")
+                                                st.success("Экспертиза через ИИ-арбитра успешно завершена!")
                                                 st.rerun()
                                         except Exception as e:
                                             st.error(f"Ошибка при работе ИИ-арбитра: {e}")
@@ -809,7 +803,7 @@ if judge_pwd:
                                 if entry["id"] in st.session_state.tracked_videos:
                                     st.markdown("🎬 **Видеозапись с трекингом ключевых точек (YOLOv8-Pose + индикатор ИИ-арбитра):**")
                                     video_bytes = st.session_state.tracked_videos[entry["id"]]
-                                    st.video(video_bytes)
+                                    st.video(video_bytes, format="video/mp4")
                                     st.download_button(
                                         label="💾 Скачать видео с трекингом (.mp4)",
                                         data=video_bytes,
@@ -820,7 +814,7 @@ if judge_pwd:
                                     )
 
                                 if reps_data:
-                                    st.markdown("**Протокол повторений по таймкодам (с индикатором ИИ-арбитра):**")
+                                    st.markdown("##### 📋 Протокол повторений по таймкодам")
                                     df_reps = pd.DataFrame(reps_data)
                                     df_reps["errors"] = df_reps["errors"].apply(
                                         lambda lst: ", ".join(lst) if isinstance(lst, list) else str(lst)
@@ -832,9 +826,30 @@ if judge_pwd:
                                     if "ai_verdict" not in df_reps.columns:
                                         df_reps["ai_verdict"] = "—"
 
-                                    df_reps = df_reps[["rep_number", "timestamp", "status_text", "ai_indicator", "ai_verdict", "errors"]]
-                                    df_reps.columns = ["№", "Таймкод", "Вердикт", "Индикатор ИИ-арбитра", "Заключение ИИ", "Причина / Ошибки"]
-                                    st.dataframe(df_reps, use_container_width=True, hide_index=True)
+                                    df_reps_display = df_reps[["rep_number", "timestamp", "status_text", "ai_indicator", "ai_verdict", "errors"]].copy()
+                                    df_reps_display.columns = ["№", "Таймкод", "Вердикт", "Индикатор ИИ-арбитра", "Заключение ИИ", "Причина / Ошибки"]
+                                    st.dataframe(df_reps_display, use_container_width=True, hide_index=True)
+
+                                    # Интерактивный просмотр стоп-кадров ИИ прямо в браузере
+                                    reps_with_storyboard = [r for r in reps_data if isinstance(r, dict) and r.get("ai_storyboard_b64")]
+                                    if reps_with_storyboard:
+                                        st.markdown("##### 🔍 Фотофиксация экспертизы ИИ-арбитра (в браузере):")
+                                        sel_rep_num = st.selectbox(
+                                            "Выберите попытку для просмотра сториборда ИИ:",
+                                            options=[r["rep_number"] for r in reps_with_storyboard],
+                                            format_func=lambda num: f"Попытка #{num}",
+                                            key=f"sb_sel_{entry['id']}"
+                                        )
+                                        target_rep = next(r for r in reps_with_storyboard if r["rep_number"] == sel_rep_num)
+                                        raw_b64 = target_rep.get("ai_storyboard_b64")
+                                        if raw_b64:
+                                            img_data = base64.b64decode(raw_b64)
+                                            st.image(
+                                                img_data,
+                                                caption=f"Попытка #{sel_rep_num}: 1. Исходный вис | 2. Тяга | 3. Пик (Желтая линия — гриф)",
+                                                use_container_width=True
+                                            )
+                                            st.info(f"**Заключение ИИ:** {target_rep.get('ai_verdict', '—')}")
 
                             with col_right:
                                 verified_val = st.number_input(
