@@ -254,7 +254,8 @@ class GeminiDisputeVerifier:
         return buf.tobytes() if ok else None
 
     def _call_gemini_rest_api(self, model_name, jpeg_bytes, prompt):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
+        clean_name = model_name.replace("models/", "")
+        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){clean_name}:generateContent?key={self.api_key}"
         b64_img = base64.b64encode(jpeg_bytes).decode("ascii")
         payload = {
             "contents": [
@@ -279,13 +280,22 @@ class GeminiDisputeVerifier:
         }
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=25.0) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "")
+        try:
+            with urllib.request.urlopen(req, timeout=25.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "")
+        except urllib.error.HTTPError as he:
+            err_body = he.read().decode("utf-8", errors="ignore")
+            try:
+                err_json = json.loads(err_body)
+                msg = err_json.get("error", {}).get("message", err_body)
+                raise RuntimeError(f"HTTP {he.code}: {msg}")
+            except Exception:
+                raise RuntimeError(f"HTTP {he.code}: {err_body[:100]}")
         return ""
 
     def verify_repetition(self, start_frame, mid_frame, peak_frame, bar_y, fsm_errors, min_elbow_deg):
@@ -323,7 +333,7 @@ class GeminiDisputeVerifier:
                 continue
             seen_models.append(clean_model)
 
-            # Способ 1: Прямой REST API v1beta (не зависит от версий SDK и защищен от 404)
+            # 1. Прямой REST-запрос через v1beta
             try:
                 raw_text = self._call_gemini_rest_api(clean_model, jpeg_bytes, prompt)
                 if raw_text.strip():
@@ -332,7 +342,7 @@ class GeminiDisputeVerifier:
             except Exception as e_rest:
                 last_err = e_rest
 
-            # Способ 2: Через SDK
+            # 2. Попытка через SDK
             try:
                 if self.sdk == "google-genai" and self.client:
                     response = self.client.models.generate_content(
@@ -368,11 +378,11 @@ class GeminiDisputeVerifier:
             if "location is not supported" in err_msg.lower() or "user location" in err_msg.lower():
                 short_err = "⚠️ Блокировка региона Google API (включите VPN)"
             elif "api_key" in err_msg.lower() or "403" in err_msg or "401" in err_msg:
-                short_err = "⚠️ Неверный или заблокированный GEMINI_API_KEY"
+                short_err = "⚠️ Неверный ключ или заблокирован Google API"
             elif "429" in err_msg or "quota" in err_msg.lower():
                 short_err = "⚠️ Превышен лимит запросов Gemini API (429 Quota)"
             elif "404" in err_msg:
-                short_err = "⚠️ Модель не найдена в текущем регионе Google API"
+                short_err = f"⚠️ Ошибка 404: {err_msg[:60]}"
             else:
                 short_err = f"⚠️ Ошибка API: {err_msg[:60]}"
             return set(fsm_errors), short_err, False, jpeg_bytes
