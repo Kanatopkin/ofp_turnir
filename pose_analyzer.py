@@ -6,6 +6,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import urllib.request
+import urllib.error
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -23,12 +25,11 @@ except ImportError:
         GEMINI_SDK = None
 
 YOLO_MODEL_NAME = os.getenv("YOLO_POSE_MODEL", "yolov8n-pose.pt")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_REFEREE_MODEL", "gemini-1.5-flash-latest")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_REFEREE_MODEL", "gemini-1.5-flash")
 GEMINI_FALLBACK_MODELS = [
-    "gemini-1.5-flash-latest",
     "gemini-1.5-flash",
-    "gemini-1.5-pro-latest",
     "gemini-1.5-pro",
+    "gemini-2.0-flash",
 ]
 _MODEL_INSTANCE = None
 
@@ -47,11 +48,11 @@ CONFIG = {
     "chin_bar_tolerance": 0.024,        # Гарантирует уверенный зачет эталонного повторения #2
     "max_peak_elbow_angle": 64.0,       # Максимальный угол в локтях на пике
     "nose_bar_margin": 0.000,
-    "max_peak_shoulder_drop": 0.048,    # Требует реального подъема плеч, а не вытягивания шеи (бракует попытку #8)
+    "max_peak_shoulder_drop": 0.048,    # Требует реального подъема плеч, а не вытягивания шеи
     "min_chin_above_frames": 1,
     # 3. Контроль техники ног и корпуса
-    "knee_bent_threshold": 158.0,       # Детекция согнутых коленей (ловит попытку #6 с коленями 149-157°)
-    "shin_ratio_threshold": 0.68,
+    "knee_bent_threshold": 158.0,       # Детекция согнутых коленей
+    "shin_ratio_threshold": 0.68,       # Детекция укорочения голени при закидывании ног назад
     "knee_err_frame_ratio": 0.20,
     "knee_err_min_frames": 2,
     "cross_product_threshold": -0.0006, # Защита от ложного срабатывания на сомкнутых стопах
@@ -60,14 +61,14 @@ CONFIG = {
     "feet_apart_ratio": 1.25,
     "feet_apart_frame_ratio": 0.30,
     "feet_apart_min_frames": 4,
-    "hip_kipping_angle": 150.0,         # Детекция рывков тазом (ловит киппинг в #9)
+    "hip_kipping_angle": 150.0,         # Детекция рывков тазом (киппинг)
     "center_body_bend_angle": 162.0,
     "hip_swing_ratio": 0.58,
     "ankle_swing_ratio": 0.50,
     "ankle_swing_span_ratio": 0.55,
     "kipping_frame_ratio": 0.20,
     "kipping_min_frames": 3,
-    "asym_elbow_diff_deg": 18.0,        # Ловит поочередный сгиб локтей в попытке #4
+    "asym_elbow_diff_deg": 18.0,        # Ловит поочередный сгиб локтей
     "asym_elbow_tilt_ratio": 0.12,
     "asym_shoulder_tilt_ratio": 0.12,
     "asym_frame_ratio": 0.15,
@@ -168,16 +169,14 @@ class GeminiDisputeVerifier:
     def __init__(self, enabled=True):
         self.api_key = _resolve_gemini_api_key()
         self.sdk = GEMINI_SDK
-        self.enabled = bool(enabled and self.api_key and self.sdk is not None)
+        self.enabled = bool(enabled and self.api_key)
         self.client = None
         self.init_error = None
 
         if not enabled:
             self.init_error = "ИИ-арбитр отключен"
         elif not self.api_key:
-            self.init_error = "Ключ GEMINI_API_KEY не найден"
-        elif self.sdk is None:
-            self.init_error = "Библиотека google-genai / google-generativeai не установлена"
+            self.init_error = "Ключ GEMINI_API_KEY не найден в Secrets"
         else:
             try:
                 if self.sdk == "google-genai":
@@ -185,8 +184,7 @@ class GeminiDisputeVerifier:
                 elif self.sdk == "legacy":
                     genai_legacy.configure(api_key=self.api_key)
             except Exception as e:
-                self.enabled = False
-                self.init_error = f"Ошибка клиента: {e}"
+                self.init_error = f"Ошибка инициализации SDK: {e}"
 
     @staticmethod
     def get_dispute_reasons(
@@ -255,6 +253,41 @@ class GeminiDisputeVerifier:
         ok, buf = cv2.imencode(".jpg", collage, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         return buf.tobytes() if ok else None
 
+    def _call_gemini_rest_api(self, model_name, jpeg_bytes, prompt):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
+        b64_img = base64.b64encode(jpeg_bytes).decode("ascii")
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "inline_data": {
+                                "mime_type": "image/jpeg",
+                                "data": b64_img
+                            }
+                        },
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json"
+            }
+        }
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=25.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+        return ""
+
     def verify_repetition(self, start_frame, mid_frame, peak_frame, bar_y, fsm_errors, min_elbow_deg):
         jpeg_bytes = self.build_storyboard_jpeg(start_frame, mid_frame, peak_frame, bar_y)
         if not self.enabled:
@@ -285,14 +318,25 @@ class GeminiDisputeVerifier:
 
         seen_models = []
         for model_name in GEMINI_FALLBACK_MODELS:
-            if model_name in seen_models:
+            clean_model = model_name.replace("models/", "")
+            if clean_model in seen_models:
                 continue
-            seen_models.append(model_name)
+            seen_models.append(clean_model)
 
+            # Способ 1: Прямой REST API v1beta (не зависит от версий SDK и защищен от 404)
             try:
-                if self.sdk == "google-genai":
+                raw_text = self._call_gemini_rest_api(clean_model, jpeg_bytes, prompt)
+                if raw_text.strip():
+                    last_err = None
+                    break
+            except Exception as e_rest:
+                last_err = e_rest
+
+            # Способ 2: Через SDK
+            try:
+                if self.sdk == "google-genai" and self.client:
                     response = self.client.models.generate_content(
-                        model=model_name,
+                        model=clean_model,
                         contents=[
                             genai_types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
                             prompt,
@@ -304,7 +348,7 @@ class GeminiDisputeVerifier:
                     )
                     raw_text = response.text or ""
                 elif self.sdk == "legacy":
-                    model_obj = genai_legacy.GenerativeModel(model_name=model_name)
+                    model_obj = genai_legacy.GenerativeModel(model_name=clean_model)
                     response = model_obj.generate_content(
                         [{"mime_type": "image/jpeg", "data": jpeg_bytes}, prompt],
                         generation_config={"temperature": 0.0, "response_mime_type": "application/json"},
@@ -315,23 +359,20 @@ class GeminiDisputeVerifier:
                 if raw_text.strip():
                     last_err = None
                     break
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                if "location is not supported" in err_str.lower() or "api_key_invalid" in err_str.lower():
-                    break
+            except Exception as e_sdk:
+                last_err = e_sdk
                 continue
 
         if last_err is not None or not raw_text.strip():
             err_msg = str(last_err) if last_err else "Пустой ответ от Gemini API"
-            if "location is not supported" in err_msg.lower():
+            if "location is not supported" in err_msg.lower() or "user location" in err_msg.lower():
                 short_err = "⚠️ Блокировка региона Google API (включите VPN)"
             elif "api_key" in err_msg.lower() or "403" in err_msg or "401" in err_msg:
                 short_err = "⚠️ Неверный или заблокированный GEMINI_API_KEY"
             elif "429" in err_msg or "quota" in err_msg.lower():
                 short_err = "⚠️ Превышен лимит запросов Gemini API (429 Quota)"
             elif "404" in err_msg:
-                short_err = "⚠️ Модель недоступна (обновите google-generativeai)"
+                short_err = "⚠️ Модель не найдена в текущем регионе Google API"
             else:
                 short_err = f"⚠️ Ошибка API: {err_msg[:60]}"
             return set(fsm_errors), short_err, False, jpeg_bytes
@@ -1098,7 +1139,7 @@ def analyze_video_pose(
 
         pre_pull_window = max(6, int(round(0.7 * eff_fps)))
         pre_pull_knee_err = deque(maxlen=pre_pull_window)
-        pre_pull_cross_err = deque(maxlen=pre_pull_window)
+        pre_pull_cross_err = deque(maxlen=pre_pull_cross_err_len := max(6, int(round(0.7 * eff_fps))))
 
         rep_start_time = 0.0
         rep_saved_hang_time = None
@@ -1163,7 +1204,6 @@ def analyze_video_pose(
             chin_above_now = False
 
             if raw_lm is not None:
-                # Точная калибровка перекладины ТОЛЬКО по первому чистому вису
                 if not bar_is_locked:
                     instant_bar_y = compute_bar_y_from_hands(raw_lm, ref_sh_w=base_shoulder_w)
                     if 0.115 <= instant_bar_y <= 0.200:
@@ -1208,7 +1248,7 @@ def analyze_video_pose(
                 shin_ratio = shin_len / max(0.04, thigh_len)
 
                 if ankles_lost_or_hidden:
-                    raw_knee = 135.0  # Фиксируем согнутые колени при закидывании ног назад
+                    raw_knee = 135.0
                 elif shin_ratio < CONFIG["shin_ratio_threshold"]:
                     sagittal_knee_deg = float(np.degrees(np.arcsin(np.clip(shin_ratio / 0.85, 0.1, 1.0))) * 1.6)
                     raw_knee = min(angle_kn_2d, sagittal_knee_deg)
