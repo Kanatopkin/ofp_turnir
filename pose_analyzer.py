@@ -289,6 +289,7 @@ class GeminiDisputeVerifier:
 
     def _call_gemini_rest_api(self, model_name, jpeg_bytes, prompt):
         clean_name = model_name.replace("models/", "")
+        # Передаем ключ и в URL, и в заголовок x-goog-api-key для поддержки ключей формата AQ.
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_name}:generateContent?key={self.api_key}"
         b64_img = base64.b64encode(jpeg_bytes).decode("ascii")
         payload = {
@@ -316,10 +317,13 @@ class GeminiDisputeVerifier:
         req = urllib.request.Request(
             url, 
             data=body, 
-            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self.api_key,
+                "User-Agent": "Mozilla/5.0"
+            }
         )
         
-        # Поддержка системного прокси или SmartDNS
         proxy_url = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
         if proxy_url:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({'https': proxy_url, 'http': proxy_url}))
