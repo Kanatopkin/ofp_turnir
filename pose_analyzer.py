@@ -172,6 +172,7 @@ class GeminiDisputeVerifier:
         self.enabled = bool(enabled and self.api_key)
         self.client = None
         self.init_error = None
+        self.resolved_model = None
 
         if not enabled:
             self.init_error = "ИИ-арбитр отключен"
@@ -179,12 +180,40 @@ class GeminiDisputeVerifier:
             self.init_error = "Ключ GEMINI_API_KEY не найден в Secrets"
         else:
             try:
+                # Автоматический опрос доступных моделей для конкретного API-ключа
+                self.resolved_model = self._discover_working_model()
                 if self.sdk == "google-genai":
                     self.client = genai.Client(api_key=self.api_key)
                 elif self.sdk == "legacy":
                     genai_legacy.configure(api_key=self.api_key)
             except Exception as e:
                 self.init_error = f"Ошибка инициализации SDK: {e}"
+
+    def _discover_working_model(self):
+        """Опрашивает Google API и выбирает первую доступную мультимодальную модель."""
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = data.get("models", [])
+                
+                # 1. Приоритет быстрым Flash-моделям
+                for m in models:
+                    methods = m.get("supportedGenerationMethods", [])
+                    name = m.get("name", "").replace("models/", "")
+                    if "generateContent" in methods and "flash" in name.lower():
+                        return name
+                        
+                # 2. Любая доступная модель Gemini с поддержкой генерации
+                for m in models:
+                    methods = m.get("supportedGenerationMethods", [])
+                    name = m.get("name", "").replace("models/", "")
+                    if "generateContent" in methods and "gemini" in name.lower():
+                        return name
+        except Exception:
+            pass
+        return "gemini-1.5-flash"
 
     @staticmethod
     def get_dispute_reasons(
@@ -255,7 +284,7 @@ class GeminiDisputeVerifier:
 
     def _call_gemini_rest_api(self, model_name, jpeg_bytes, prompt):
         clean_name = model_name.replace("models/", "")
-        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){clean_name}:generateContent?key={self.api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_name}:generateContent?key={self.api_key}"
         b64_img = base64.b64encode(jpeg_bytes).decode("ascii")
         payload = {
             "contents": [
@@ -295,7 +324,7 @@ class GeminiDisputeVerifier:
                 msg = err_json.get("error", {}).get("message", err_body)
                 raise RuntimeError(f"HTTP {he.code}: {msg}")
             except Exception:
-                raise RuntimeError(f"HTTP {he.code}: {err_body[:100]}")
+                raise RuntimeError(f"HTTP {he.code}: {err_body[:120]}")
         return ""
 
     def verify_repetition(self, start_frame, mid_frame, peak_frame, bar_y, fsm_errors, min_elbow_deg):
@@ -323,17 +352,19 @@ class GeminiDisputeVerifier:
             '"no_kipping": bool, "arms_symmetric": bool, "short_reason": "краткий вывод до 8 слов"}'
         )
 
+        # Формируем список кандидатов: сначала динамически обнаруженная модель, затем резервные
+        models_to_try = []
+        if self.resolved_model:
+            models_to_try.append(self.resolved_model)
+        for m in ["gemini-1.5-flash", "gemini-1.5-flash-latest", "gemini-2.0-flash", "gemini-1.5-pro"]:
+            if m not in models_to_try:
+                models_to_try.append(m)
+
         last_err = None
         raw_text = ""
 
-        seen_models = []
-        for model_name in GEMINI_FALLBACK_MODELS:
-            clean_model = model_name.replace("models/", "")
-            if clean_model in seen_models:
-                continue
-            seen_models.append(clean_model)
-
-            # 1. Прямой REST-запрос через v1beta
+        for clean_model in models_to_try:
+            # 1. Прямой REST-запрос через v1beta (наиболее надежный)
             try:
                 raw_text = self._call_gemini_rest_api(clean_model, jpeg_bytes, prompt)
                 if raw_text.strip():
@@ -342,7 +373,7 @@ class GeminiDisputeVerifier:
             except Exception as e_rest:
                 last_err = e_rest
 
-            # 2. Попытка через SDK
+            # 2. Вызов через SDK (если доступен)
             try:
                 if self.sdk == "google-genai" and self.client:
                     response = self.client.models.generate_content(
