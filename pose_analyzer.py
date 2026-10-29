@@ -149,19 +149,16 @@ class StabilizedLandmark:
 
 def enhance_frame_backlight(frame):
     """
-    Автоматически увеличивает яркость и вытягивает детали из теней,
-    если спортсмен находится в контровом свете против яркого неба.
+    Автоматически осветляет глубокие тени силуэта спортсмена при контровом свете.
     """
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
 
     mean_l = float(np.mean(l))
-    # Если кадр умеренно тёмный или контрастный (яркое небо, тёмный спортсмен)
     if mean_l < 140.0:
         clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
         l_enhanced = clahe.apply(l)
 
-        # Мягкое гамма-осветление глубоких теней
         inv_gamma = 0.80
         table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
         l_boosted = cv2.LUT(l_enhanced, table)
@@ -966,37 +963,28 @@ def draw_hud(
         cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 4)
         cv2.putText(frame, label_text, (15, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, bar_color, 2)
 
+    # Компактный аккуратный бейдж вердикта (не закрывает лицо и снаряд)
     if ai_banner_active and ai_last_rep_num is not None:
-        banner_overlay = frame.copy()
-        bw, bh = min(w - 20, 410), 58
+        bw, bh = 205, 38
         bx1 = max(10, w - bw - 12)
-        by1 = 12
+        by1 = 10
         bg_color = (25, 95, 25) if ai_last_valid else (45, 20, 110)
         border_color = (0, 255, 120) if ai_last_valid else (255, 80, 255)
 
+        banner_overlay = frame.copy()
         cv2.rectangle(banner_overlay, (bx1, by1), (bx1 + bw, by1 + bh), bg_color, -1)
-        cv2.addWeighted(banner_overlay, 0.82, frame, 0.18, 0, frame)
+        cv2.addWeighted(banner_overlay, 0.85, frame, 0.15, 0, frame)
         cv2.rectangle(frame, (bx1, by1), (bx1 + bw, by1 + bh), border_color, 2)
 
-        verdict_tag = "VALID (GTO/VSOSH)" if ai_last_valid else "REJECTED (GTO/VSOSH)"
+        verdict_tag = "VALID" if ai_last_valid else "REJECTED"
         cv2.putText(
             frame,
-            f"VERDICT REP #{ai_last_rep_num}",
-            (bx1 + 12, by1 + 23),
+            f"REP #{ai_last_rep_num}: {verdict_tag}",
+            (bx1 + 10, by1 + 25),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.54,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"{verdict_tag}",
-            (bx1 + 12, by1 + 47),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
+            0.50,
             (255, 255, 255),
-            1,
+            2,
             cv2.LINE_AA,
         )
 
@@ -1029,7 +1017,7 @@ def get_calibration_preview(video_path, manual_bar_y=None):
     h, w, _ = frame.shape
     detected_bar_y = 0.20
 
-    # Предобработка кадра для защиты от контрового света
+    # Осветление кадра для четкой детекции в контровом свете
     enhanced_frame = enhance_frame_backlight(frame)
 
     model = get_yolo_model()
@@ -1416,10 +1404,14 @@ def analyze_video_pose(
             chin_above_now = False
 
             if raw_lm is not None:
-                # Умная калибровка перекладины: запускается ТОЛЬКО когда руки подняты в вис
+                # Надежная автокалибровка перекладины с отсечением ложных сдвигов
                 if not bar_is_locked:
                     instant_bar_y = compute_bar_y_from_hands(raw_lm, ref_sh_w=base_shoulder_w)
-                    if instant_bar_y is not None and (0.08 <= instant_bar_y <= 0.38):
+                    if instant_bar_y is not None and (0.06 <= instant_bar_y <= 0.42):
+                        # Сброс образцов при резком скачке высоты (например, атлет перехватился или спрыгнул с верхней балки)
+                        if initial_bar_samples and abs(instant_bar_y - float(np.median(initial_bar_samples))) > 0.045:
+                            initial_bar_samples.clear()
+
                         initial_bar_samples.append(instant_bar_y)
                         bar_y = float(np.median(initial_bar_samples))
                         if len(initial_bar_samples) >= CONFIG["bar_calibration_frames"]:
